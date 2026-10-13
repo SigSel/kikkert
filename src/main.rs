@@ -8,18 +8,18 @@ use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPast
 use ratatui::crossterm::execute;
 use tokio::sync::mpsc;
 
-use rowboat::app::{App, Msg};
-use rowboat::config::{self, Config};
-use rowboat::db::{Session, meta};
-use rowboat::{op, ui};
+use kikkert::app::{App, Msg};
+use kikkert::config::{self, Config};
+use kikkert::db::{Session, meta};
+use kikkert::{op, ui};
 
 /// A read-only, keyboard-driven database viewer.
 ///
 /// Connections are listed in a config file and their details are read from
-/// 1Password when you connect. rowboat only reads: statements that could
+/// 1Password when you connect. kikkert only reads: statements that could
 /// change anything are refused.
 #[derive(Parser)]
-#[command(name = "rowboat", version)]
+#[command(name = "kikkert", version)]
 struct Cli {
     /// Open this connection straight away
     connection: Option<String>,
@@ -56,7 +56,7 @@ fn main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(e) => {
-            eprintln!("rowboat: could not start: {e}");
+            eprintln!("kikkert: could not start: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -67,7 +67,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("rowboat: {e:#}");
+            eprintln!("kikkert: {e:#}");
             ExitCode::FAILURE
         }
     }
@@ -103,7 +103,7 @@ async fn run(cli: Cli) -> Result<()> {
 fn list(cfg: &Config, path: &std::path::Path) -> Result<()> {
     if cfg.connections.is_empty() {
         println!("No connections in {}", path.display());
-        println!("Run `rowboat --example-config` to see what one looks like.");
+        println!("Run `kikkert --example-config` to see what one looks like.");
         return Ok(());
     }
     let width = cfg

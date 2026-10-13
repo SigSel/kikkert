@@ -1,4 +1,4 @@
-//! rowboat: a read-only, keyboard-driven database viewer for the terminal.
+//! kikkert: a read-only, keyboard-driven database viewer for the terminal.
 
 pub mod app;
 pub mod clipboard;

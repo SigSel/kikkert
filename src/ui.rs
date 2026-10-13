@@ -208,7 +208,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![Span::styled(" rowboat ", selected())];
+    let mut spans = vec![Span::styled(" kikkert ", selected())];
     if let (Screen::Workspace, Some(ws)) = (app.screen, &app.ws) {
         let spec = ws.session.spec();
         spans.push(Span::styled(format!("  {}", spec.name), bold()));
@@ -398,7 +398,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from("username and password. Then press r to reload."));
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            "rowboat --example-config prints a fuller example.",
+            "kikkert --example-config prints a fuller example.",
             dim(),
         )));
         if let Some(error) = &picker.error {
@@ -410,9 +410,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, app: &App) {
         }
         // Room for the border, the padding and a wrapped config path.
         let height = lines.len() as u16 + 6;
-        let block = Block::bordered()
-            .title(" Welcome aboard ")
-            .border_style(accent());
+        let block = Block::bordered().title(" Welcome ").border_style(accent());
         let at = centered(area, 86, height);
         frame.render_widget(
             Paragraph::new(lines)
@@ -1344,7 +1342,7 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
             "SQL editor",
             &[
                 ("F5  Ctrl-R", "run"),
-                ("Ctrl-L", "reset to the SQL rowboat generated"),
+                ("Ctrl-L", "reset to the SQL kikkert generated"),
                 ("Esc", "close"),
             ],
         ),
@@ -1362,7 +1360,7 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
         lines
     };
     let note = Line::from(Span::styled(
-        " rowboat only reads. Statements that could change anything are refused.",
+        " kikkert only reads. Statements that could change anything are refused.",
         dim(),
     ));
 

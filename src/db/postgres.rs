@@ -77,7 +77,7 @@ async fn connect(spec: &ConnectionSpec) -> Result<PgConnection> {
     let mut options = PgConnectOptions::new_without_pgpass()
         .host(&spec.host)
         .port(spec.port.unwrap_or(5432))
-        .application_name("rowboat")
+        .application_name("kikkert")
         .ssl_mode(match spec.tls.unwrap_or_default() {
             TlsMode::Disable => PgSslMode::Disable,
             TlsMode::Prefer => PgSslMode::Prefer,

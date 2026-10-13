@@ -230,7 +230,7 @@ impl Session {
         self.run(sql, limits).await
     }
 
-    /// Runs one of rowboat's own catalog queries from [`meta`].
+    /// Runs one of kikkert's own catalog queries from [`meta`].
     pub async fn catalog_query(&self, sql: &str, limits: Limits) -> Result<ResultSet> {
         self.run(sql, limits).await
     }

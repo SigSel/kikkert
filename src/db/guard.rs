@@ -1,4 +1,4 @@
-//! The read-only gate. Every statement that did not come from rowboat's own
+//! The read-only gate. Every statement that did not come from kikkert's own
 //! catalog queries passes through [`check`] before it is sent anywhere.
 //!
 //! The rule is an allow-list: exactly one statement, and it must be a query
@@ -30,7 +30,7 @@ pub struct Refusal(String);
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Not sent: rowboat is read-only. {}", self.0)
+        write!(f, "Not sent: kikkert is read-only. {}", self.0)
     }
 }
 

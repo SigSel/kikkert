@@ -4,9 +4,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use rowboat::db::meta::{self, DbObject, ObjectKind};
-use rowboat::db::{ConnectionSpec, Engine, Limits, ResultSet, Session, TlsMode};
-use rowboat::query::{ColumnInfo, Dir, Filter, Mode, Op, TableQuery};
+use kikkert::db::meta::{self, DbObject, ObjectKind};
+use kikkert::db::{ConnectionSpec, Engine, Limits, ResultSet, Session, TlsMode};
+use kikkert::query::{ColumnInfo, Dir, Filter, Mode, Op, TableQuery};
 
 const LIMITS: Limits = Limits {
     timeout: Duration::from_secs(10),
@@ -14,7 +14,7 @@ const LIMITS: Limits = Limits {
 };
 
 fn spec(engine: Engine) -> Option<ConnectionSpec> {
-    std::env::var("ROWBOAT_TEST_DBS").ok()?;
+    std::env::var("KIKKERT_TEST_DBS").ok()?;
     let base = ConnectionSpec {
         name: format!("test-{}", engine.label()),
         engine,
@@ -34,27 +34,27 @@ fn spec(engine: Engine) -> Option<ConnectionSpec> {
             port: Some(55432),
             database: Some("postgres".into()),
             username: Some("postgres".into()),
-            password: Some("rowboat".into()),
+            password: Some("kikkert".into()),
             ..base
         },
         Engine::Mysql => ConnectionSpec {
             port: Some(53306),
             database: Some("shop".into()),
             username: Some("root".into()),
-            password: Some("rowboat".into()),
+            password: Some("kikkert".into()),
             ..base
         },
         Engine::Mssql => ConnectionSpec {
             port: Some(51433),
-            database: Some("rowboat_test".into()),
+            database: Some("kikkert_test".into()),
             username: Some("sa".into()),
-            password: Some("Rowboat!Passw0rd".into()),
+            password: Some("Kikkert!Passw0rd".into()),
             tls: Some(TlsMode::Require),
             ..base
         },
         Engine::Sqlite => ConnectionSpec {
             host: String::new(),
-            path: Some(PathBuf::from(std::env::var("ROWBOAT_TEST_SQLITE").ok()?)),
+            path: Some(PathBuf::from(std::env::var("KIKKERT_TEST_SQLITE").ok()?)),
             ..base
         },
     })
@@ -400,7 +400,7 @@ async fn exercise(engine: Engine) {
     // --- read-only, second line: the server, with the guard bypassed -------
     // `catalog_query` skips the guard, which is exactly the situation the
     // read-only session exists for.
-    let scratch = engine.qualify(db.object("customers").schema.as_deref(), "rowboat_was_here");
+    let scratch = engine.qualify(db.object("customers").schema.as_deref(), "kikkert_was_here");
     let writes = [
         format!(
             "INSERT INTO {customers} (id, name, created_at) VALUES (99, 'intruder', '2024-01-01 00:00:00')"
@@ -431,7 +431,7 @@ async fn exercise(engine: Engine) {
     assert!(
         !meta::parse_objects(&listing)
             .iter()
-            .any(|o| o.name == "rowboat_was_here"),
+            .any(|o| o.name == "kikkert_was_here"),
         "no table was created"
     );
 

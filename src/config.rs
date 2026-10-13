@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::db::{Limits, TlsMode};
 
-pub const EXAMPLE: &str = r#"# rowboat config
+pub const EXAMPLE: &str = r#"# kikkert config
 #
 # Each [[connection]] is one database. The usual setup keeps everything in
 # 1Password: create a "Database" item with type, server, port, database,
@@ -187,12 +187,12 @@ pub const FIELD_KEYS: [&str; 8] = [
 ];
 
 pub fn default_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("ROWBOAT_CONFIG") {
+    if let Some(path) = std::env::var_os("KIKKERT_CONFIG") {
         return PathBuf::from(path);
     }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("rowboat")
+        .join("kikkert")
         .join("config.toml")
 }
 

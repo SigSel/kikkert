@@ -33,7 +33,7 @@ fn config_for(spec: &ConnectionSpec) -> Config {
         spec.username.as_deref().unwrap_or_default(),
         spec.password.as_deref().unwrap_or_default(),
     ));
-    config.application_name("rowboat");
+    config.application_name("kikkert");
     config.readonly(spec.read_intent);
     match spec.tls.unwrap_or(TlsMode::Require) {
         TlsMode::Disable => config.encryption(EncryptionLevel::NotSupported),

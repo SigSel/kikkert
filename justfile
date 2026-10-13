@@ -46,12 +46,12 @@ test-dbs *args:
 # Full CI pipeline locally
 ci: fmt-check check test test-dbs
 
-# Run rowboat against the test databases, starting them if needed (`just dev demo-postgres`)
+# Run kikkert against the test databases, starting them if needed (`just dev demo-postgres`)
 dev *args:
     scripts/test-dbs.sh status >/dev/null 2>&1 || scripts/test-dbs.sh up
     cargo run -- --config scripts/demo.toml {{args}}
 
-# Run rowboat with your own config (`just run orders-prod`, `just run --check orders-prod`)
+# Run kikkert with your own config (`just run orders-prod`, `just run --check orders-prod`)
 run *args:
     cargo run -- {{args}}
 
@@ -59,7 +59,7 @@ run *args:
 build:
     cargo build --release
 
-# Install rowboat into ~/.cargo/bin
+# Install kikkert into ~/.cargo/bin
 install:
     cargo install --path . --locked
 

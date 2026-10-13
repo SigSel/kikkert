@@ -1,12 +1,12 @@
-IF DB_ID('rowboat_test') IS NOT NULL
+IF DB_ID('kikkert_test') IS NOT NULL
 BEGIN
-  ALTER DATABASE rowboat_test SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
-  DROP DATABASE rowboat_test;
+  ALTER DATABASE kikkert_test SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+  DROP DATABASE kikkert_test;
 END
 GO
-CREATE DATABASE rowboat_test;
+CREATE DATABASE kikkert_test;
 GO
-USE rowboat_test;
+USE kikkert_test;
 GO
 CREATE SCHEMA shop;
 GO

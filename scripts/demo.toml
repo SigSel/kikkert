@@ -1,4 +1,4 @@
-# Points rowboat at the throwaway databases from scripts/test-dbs.sh:
+# Points kikkert at the throwaway databases from scripts/test-dbs.sh:
 #
 #   scripts/test-dbs.sh up
 #   cargo run -- --config scripts/demo.toml
@@ -13,7 +13,7 @@ host = "127.0.0.1"
 port = 55432
 database = "postgres"
 username = "postgres"
-password = "rowboat"
+password = "kikkert"
 
 [[connection]]
 name = "demo-mysql"
@@ -22,18 +22,18 @@ host = "127.0.0.1"
 port = 53306
 database = "shop"
 username = "root"
-password = "rowboat"
+password = "kikkert"
 
 [[connection]]
 name = "demo-sqlserver"
 engine = "mssql"
 host = "127.0.0.1"
 port = 51433
-database = "rowboat_test"
+database = "kikkert_test"
 username = "sa"
-password = "Rowboat!Passw0rd"
+password = "Kikkert!Passw0rd"
 
 [[connection]]
 name = "demo-sqlite"
 engine = "sqlite"
-path = "target/rowboat-test.sqlite"
+path = "target/kikkert-test.sqlite"

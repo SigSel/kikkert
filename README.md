@@ -1,14 +1,15 @@
-# rowboat
+# kikkert
 
-A read-only, keyboard-driven database viewer for the terminal. It paddles
-gently through your rows and never makes waves.
+A read-only, keyboard-driven database viewer for the terminal. *Kikkert* is
+Norwegian for binoculars: it gets you a close look at your data from a safe
+distance, and never touches it.
 
 - **Engines:** PostgreSQL, MySQL / MariaDB, SQL Server and SQLite.
 - **Credentials from 1Password:** a connection points at a 1Password item, and
   the server, database, username and password are read from it when you
   connect. Nothing secret is written to disk.
 - **Search without writing SQL:** pick a column, how to match and a value.
-  rowboat writes the SQL, shows it, and lets you edit it.
+  kikkert writes the SQL, shows it, and lets you edit it.
 - **Sort, page, find duplicates, inspect structure**, all from the keyboard.
 - **Read-only by construction:** see [How read-only is enforced](#how-read-only-is-enforced).
 
@@ -25,8 +26,8 @@ in the desktop app, so that unlocking happens in the app and not in the terminal
 
 ## Configure
 
-Connections live in `~/.config/rowboat/config.toml` (or wherever
-`$ROWBOAT_CONFIG` or `--config` points). `rowboat --example-config` prints a
+Connections live in `~/.config/kikkert/config.toml` (or wherever
+`$KIKKERT_CONFIG` or `--config` points). `kikkert --example-config` prints a
 commented example.
 
 ```toml
@@ -62,7 +63,7 @@ The simplest item is 1Password's own **Database** type, which already has the
 right fields: type, server, port, database, username, password. Any item works
 as long as its fields have recognisable names:
 
-| rowboat needs | Field names it looks for |
+| kikkert needs | Field names it looks for |
 |---|---|
 | engine | type, engine, driver |
 | host | server, hostname, host, server url, url, address, endpoint (or the item's website) |
@@ -87,7 +88,7 @@ engine = "mssql"
 fields = { host = "Primary Node", database = "Catalog" }
 ```
 
-`rowboat --check orders-prod` resolves a connection and tries it without
+`kikkert --check orders-prod` resolves a connection and tries it without
 opening the interface, which is the quickest way to debug a new entry. It
 prints where it is connecting and as whom, never the password.
 
@@ -117,9 +118,9 @@ max_column_width = 40
 ## Use
 
 ```sh
-rowboat                # choose a connection
-rowboat orders-prod    # connect straight away
-rowboat --list         # print the configured connections
+kikkert                # choose a connection
+kikkert orders-prod    # connect straight away
+kikkert --list         # print the configured connections
 ```
 
 Press `?` at any time for the full list of keys.
@@ -151,10 +152,10 @@ ids are compared as text, so `2024-03` finds March and `42` finds order 1042.
 
 ## How read-only is enforced
 
-There is no write path in rowboat: it has no feature that inserts, updates or
+There is no write path in kikkert: it has no feature that inserts, updates or
 deletes. On top of that there are three independent layers.
 
-1. **Statement guard.** Every statement that is not one of rowboat's own
+1. **Statement guard.** Every statement that is not one of kikkert's own
    catalog queries is parsed before it is sent. Exactly one statement is
    allowed, and it must be a `SELECT` (or `EXPLAIN`, `SHOW`, `DESCRIBE` of
    one). Writes hidden inside a query are refused too: data-modifying CTEs,
@@ -170,7 +171,7 @@ deletes. On top of that there are three independent layers.
    | SQL Server | no read-only session exists; each statement runs in a transaction that is always rolled back |
 
 3. **A read-only login.** This is the one guarantee that does not depend on
-   rowboat being right, and for SQL Server it is the only server-side one.
+   kikkert being right, and for SQL Server it is the only server-side one.
    Give the account `SELECT` only (`db_datareader`, `pg_read_all_data`,
    `GRANT SELECT`).
 
@@ -180,7 +181,7 @@ three refuse them outright, and on SQL Server they are rolled back.
 
 Being read-only is not the same as being harmless: a heavy query still costs
 the server. Queries have a timeout, `Esc` cancels on the server as well as in
-the interface, and on SQL Server rowboat sets a lock timeout and low deadlock
+the interface, and on SQL Server kikkert sets a lock timeout and low deadlock
 priority so it loses to real workloads.
 
 ## Not there yet
@@ -210,7 +211,7 @@ in containers, plus a SQLite file.
 just test-dbs     # starts the databases, runs the tests, removes them again
 just dbs-up       # or keep them running while you work...
 just test-dbs     # ...and the tests reuse them and leave them up
-just dev          # rowboat pointed at the test databases, to row around in
+just dev          # kikkert pointed at the test databases, to look around in
 just dbs-down
 ```
 

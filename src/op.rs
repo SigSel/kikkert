@@ -152,7 +152,7 @@ impl Item {
             .map(|f| f.value.as_str())
     }
 
-    /// The field for one of rowboat's keys, found by its usual names.
+    /// The field for one of kikkert's keys, found by its usual names.
     fn by_key(&self, key: &str) -> Option<&str> {
         let found = synonyms(key).iter().find_map(|name| {
             self.fields
