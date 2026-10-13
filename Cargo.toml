@@ -1,0 +1,27 @@
+[package]
+name = "rowboat"
+version = "0.1.0"
+edition = "2024"
+description = "A read-only, keyboard-driven database viewer for the terminal"
+publish = false
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+futures-util = "0.3"
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlparser = { version = "0.63", features = ["visitor"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "mysql", "sqlite"] }
+tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls", "chrono", "sql-browser-tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "net", "io-util"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+toml = "1"
+unicode-width = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = true

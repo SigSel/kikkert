@@ -1,0 +1,39 @@
+# Points rowboat at the throwaway databases from scripts/test-dbs.sh:
+#
+#   scripts/test-dbs.sh up
+#   cargo run -- --config scripts/demo.toml
+#
+# The passwords below belong to those local containers and nothing else.
+# Real connections should take theirs from 1Password instead.
+
+[[connection]]
+name = "demo-postgres"
+engine = "postgres"
+host = "127.0.0.1"
+port = 55432
+database = "postgres"
+username = "postgres"
+password = "rowboat"
+
+[[connection]]
+name = "demo-mysql"
+engine = "mysql"
+host = "127.0.0.1"
+port = 53306
+database = "shop"
+username = "root"
+password = "rowboat"
+
+[[connection]]
+name = "demo-sqlserver"
+engine = "mssql"
+host = "127.0.0.1"
+port = 51433
+database = "rowboat_test"
+username = "sa"
+password = "Rowboat!Passw0rd"
+
+[[connection]]
+name = "demo-sqlite"
+engine = "sqlite"
+path = "target/rowboat-test.sqlite"
