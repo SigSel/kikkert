@@ -1,0 +1,73 @@
+# cargo-deny configuration (https://embarkstudios.github.io/cargo-deny/). Run with `just deny`.
+#
+# Checks the dependency tree for RustSec advisories, licenses that are not compatible with
+# shipping kikkert under Apache-2.0, duplicate crate versions, and crates that do not come
+# from crates.io.
+
+[graph]
+# The platforms kikkert is built for: Linux and macOS, x86_64 and arm64. Crates that are only
+# pulled in for other platforms are not checked.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+# Vulnerabilities, unsound crates and yanked versions fail the check. Unmaintained crates
+# are reported for the whole tree.
+unmaintained = "all"
+yanked = "deny"
+# Every ignore needs a reason and should be revisited; prefer `cargo update -p <crate>`.
+ignore = []
+
+[licenses]
+# Permissive licenses compatible with distributing kikkert (Apache-2.0) as source and as a
+# binary.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+exceptions = [
+    # Weak (file level) copyleft, used unmodified through `dirs`, which finds the config
+    # directory. Available from crates.io.
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+# Duplicate versions cost build time and binary size but are not a security problem.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = [
+    # TLS is rustls only; openssl would add a second TLS stack and system library dependency.
+    { crate = "openssl-sys", use-instead = "rustls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

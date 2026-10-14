@@ -15,6 +15,10 @@ fmt-check:
 check:
     cargo clippy --all-targets -- -D warnings
 
+# Dependency hygiene with cargo-deny (deny.toml): RustSec advisories, licenses, bans, sources
+deny:
+    cargo deny check --hide-inclusion-graph
+
 # Unit tests, no database needed (`just test guard` runs a subset)
 test *args:
     cargo test --lib {{args}}
@@ -44,7 +48,7 @@ test-dbs *args:
     scripts/test-dbs.sh test {{args}}
 
 # Full CI pipeline locally
-ci: fmt-check check test test-dbs
+ci: fmt-check check deny test test-dbs
 
 # Run kikkert against the test databases, starting them if needed (`just dev demo-postgres`)
 dev *args:

@@ -201,8 +201,12 @@ Tasks are in the `justfile`; `just --list` shows them all.
 just              # clippy and unit tests
 just fmt          # format
 just test guard   # unit tests matching "guard"; no database needed
-just ci           # formatting, clippy, unit tests and engine tests
+just deny         # advisories, licences and sources of the dependencies
+just ci           # formatting, clippy, dependencies, unit tests and engine tests
 ```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the same checks on every push to
+`main` and on pull requests.
 
 The engine tests run against real databases: Postgres, MySQL and SQL Server
 in containers, plus a SQLite file.
@@ -221,3 +225,7 @@ EULA. Without `just`, `scripts/test-dbs.sh up|status|test|down` does the same.
 
 The 1Password integration has only been tested against a stand-in for `op`
 that returns items in the documented JSON format, not against a live account.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE).

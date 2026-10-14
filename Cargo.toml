@@ -3,6 +3,8 @@ name = "kikkert"
 version = "0.1.0"
 edition = "2024"
 description = "A read-only, keyboard-driven database viewer for the terminal"
+license = "Apache-2.0"
+repository = "https://github.com/SigSel/kikkert"
 publish = false
 
 [dependencies]

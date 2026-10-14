@@ -1,0 +1,110 @@
+name: CI
+
+# What `just ci` runs, as two jobs: formatting, clippy, the dependency check and the unit tests;
+# and the engine tests against Postgres, MySQL and SQL Server in containers plus a SQLite file.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "LICENSE"]
+  pull_request:
+    paths-ignore: ["**.md", "LICENSE"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # The toolchain the code is linted with (clippy's lints change from release to release).
+  RUST_TOOLCHAIN: "1.94.1"
+
+jobs:
+  checks:
+    name: Lint, dependencies, unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install just and cargo-deny
+        run: .github/scripts/install-tools.sh
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version && cargo --version && just --version && cargo deny --version
+
+      - name: Cache of dependencies and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-checks-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-checks-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Formatting
+        run: just fmt-check
+
+      - name: Clippy
+        run: just check
+
+      - name: Advisories, licenses and sources of the dependencies
+        run: just deny
+
+      - name: Unit tests
+        run: just test
+
+  engines:
+    name: Engine tests against real databases
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install just
+        run: .github/scripts/install-tools.sh
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version && cargo --version && just --version
+
+      - name: Cache of dependencies and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-engines-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-engines-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Container engine and sqlite3
+        run: |
+          podman --version
+          command -v sqlite3 >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3; }
+          sqlite3 --version
+          echo "$(nproc) CPUs, $(free -g | awk '/^Mem:/ {print $2}') GiB memory"
+
+      # Starts throwaway databases, runs the tests, removes them again. Starting the SQL Server
+      # container accepts Microsoft's developer EULA (ACCEPT_EULA=Y in scripts/test-dbs.sh).
+      - name: Engine tests (Postgres, MySQL, SQL Server, SQLite)
+        run: just test-dbs
