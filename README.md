@@ -150,6 +150,12 @@ Press `?` at any time for the full list of keys.
 Filtering "contains" works on any column, not only text: numbers, dates and
 ids are compared as text, so `2024-03` finds March and `42` finds order 1042.
 
+kikkert draws in its own colours rather than the terminal theme's sixteen,
+which themes remap too freely to keep dimmed text and the selection readable.
+Terminals that say they take 24-bit colour (`COLORTERM=truecolor`, or kitty,
+WezTerm, Ghostty, iTerm2, Windows Terminal) get the palette as designed, others
+the nearest of the standard 256. It is made for a dark background.
+
 ## How read-only is enforced
 
 There is no write path in kikkert: it has no feature that inserts, updates or

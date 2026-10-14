@@ -1,47 +1,122 @@
 //! Drawing. Everything on screen is derived from [`App`] each frame; the only
 //! things written back are scroll offsets that depend on the window size.
 
+mod syntax;
+mod theme;
+
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     App, FilterDialog, FilterField, Focus, Grid, Overlay, Pane, Record, Screen, Total, Workspace,
 };
+use crate::db::Engine;
 use crate::db::meta::ObjectKind;
 use crate::input::{Editor, Input};
 use crate::query::{Dir, Filter, Mode, Op};
+use theme::theme;
 
-const ACCENT: Color = Color::Cyan;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-fn dim() -> Style {
-    Style::new().fg(Color::DarkGray)
+/// A key and what it does, as shown in the status bar and on popups.
+type Hints = &'static [(&'static str, &'static str)];
+
+fn muted() -> Style {
+    Style::new().fg(theme().muted)
+}
+
+fn faint() -> Style {
+    Style::new().fg(theme().faint)
+}
+
+fn subtle() -> Style {
+    Style::new().fg(theme().subtle)
 }
 
 fn accent() -> Style {
-    Style::new().fg(ACCENT)
+    Style::new().fg(theme().accent)
 }
 
 fn bold() -> Style {
     Style::new().add_modifier(Modifier::BOLD)
 }
 
-fn selected() -> Style {
+fn good() -> Style {
+    Style::new().fg(theme().good)
+}
+
+fn bad() -> Style {
+    Style::new().fg(theme().bad)
+}
+
+fn null() -> Style {
+    muted().add_modifier(Modifier::ITALIC)
+}
+
+/// The cursor where it matters most: the grid cell, the chosen option.
+fn cursor() -> Style {
+    let t = theme();
     Style::new()
-        .fg(Color::Black)
-        .bg(ACCENT)
+        .fg(t.on_accent)
+        .bg(t.accent)
         .add_modifier(Modifier::BOLD)
 }
 
-fn border(focused: bool) -> Style {
-    if focused { accent() } else { dim() }
+/// The selected line of a list; it lights up when the list has focus.
+fn highlight(focused: bool) -> Style {
+    let t = theme();
+    let style = Style::new().bg(t.surface).fg(t.text);
+    if focused {
+        style.fg(t.accent).add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
+/// A rounded box whose border lights up when it has focus.
+fn panel<'a>(focused: bool) -> Block<'a> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(if focused { accent() } else { faint() })
+}
+
+fn panel_title(title: &str, focused: bool) -> Span<'static> {
+    let style = if focused {
+        accent().add_modifier(Modifier::BOLD)
+    } else {
+        subtle()
+    };
+    Span::styled(format!(" {title} "), style)
+}
+
+fn hint_spans(hints: &[(&str, &str)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, (key, action)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        if !key.is_empty() {
+            spans.push(Span::styled(key.to_string(), accent()));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(action.to_string(), muted()));
+    }
+    spans
+}
+
+/// Hints for the bottom border of a box.
+fn hint_title(hints: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(hint_spans(hints));
+    spans.push(Span::raw(" "));
+    Line::from(spans).right_aligned()
 }
 
 // ---- text helpers ---------------------------------------------------------
@@ -140,6 +215,32 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// Lines in the middle of `area`, each centred.
+fn draw_centered(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+    let at = centered(area, area.width, lines.len() as u16);
+    frame.render_widget(
+        Paragraph::new(lines).centered().wrap(Wrap { trim: true }),
+        at,
+    );
+}
+
+/// The part of a line from char `skip`, at most `take` chars of it.
+fn crop(line: &Line<'static>, skip: usize, take: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut at = 0;
+    for span in &line.spans {
+        let len = span.content.chars().count();
+        let start = skip.saturating_sub(at).min(len);
+        let end = (skip + take).saturating_sub(at).min(len);
+        if start < end {
+            let piece: String = span.content.chars().skip(start).take(end - start).collect();
+            spans.push(Span::styled(piece, span.style));
+        }
+        at += len;
+    }
+    Line::from(spans)
+}
+
 /// Draws a one-line input and, when focused, puts the cursor in it.
 fn draw_input(frame: &mut Frame, area: Rect, input: &Input, focused: bool, style: Style) {
     if area.width == 0 || area.height == 0 {
@@ -169,6 +270,39 @@ fn draw_input(frame: &mut Frame, area: Rect, input: &Input, focused: bool, style
     }
 }
 
+/// A scroll thumb drawn over a border, when there is more than fits.
+/// `track` is one cell wide (vertical) or one cell high (horizontal).
+fn scrollbar(frame: &mut Frame, track: Rect, offset: usize, shown: usize, total: usize, lit: bool) {
+    if total <= shown || shown == 0 {
+        return;
+    }
+    let vertical = track.width == 1;
+    let length = if vertical { track.height } else { track.width } as usize;
+    if length == 0 {
+        return;
+    }
+    let thumb = (length * shown / total).clamp(1, length);
+    let start = (length - thumb) * offset.min(total - shown) / (total - shown);
+    // Brighter than any border, so it shows on a lit one too.
+    let style = Style::new().fg(if lit { theme().text } else { theme().muted });
+    let buffer = frame.buffer_mut();
+    for i in start..start + thumb {
+        let (x, y, symbol) = if vertical {
+            (track.x, track.y + i as u16, "┃")
+        } else {
+            (track.x + i as u16, track.y, "━")
+        };
+        buffer[(x, y)].set_symbol(symbol).set_style(style);
+    }
+}
+
+/// Fades what is behind a popup, so the popup is what the eye lands on.
+fn scrim(frame: &mut Frame, area: Rect) {
+    frame
+        .buffer_mut()
+        .set_style(area, Style::reset().fg(theme().faint));
+}
+
 // ---- the frame ------------------------------------------------------------
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -186,6 +320,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_status(frame, status, app);
 
+    if !matches!(app.overlay, Overlay::None | Overlay::Editor(_)) {
+        scrim(frame, body);
+    }
     match &mut app.overlay {
         Overlay::Help { scroll } => draw_help(frame, body, scroll),
         Overlay::Filter(dialog) => {
@@ -208,29 +345,42 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![Span::styled(" kikkert ", selected())];
-    if let (Screen::Workspace, Some(ws)) = (app.screen, &app.ws) {
-        let spec = ws.session.spec();
-        spans.push(Span::styled(format!("  {}", spec.name), bold()));
-        spans.push(Span::styled(
-            format!("  {}  {}", spec.engine.label(), spec.target()),
-            dim(),
-        ));
-    }
+    let t = theme();
+    let mut spans = vec![Span::styled(
+        " kikkert ",
+        Style::new()
+            .fg(t.on_accent)
+            .bg(t.accent)
+            .add_modifier(Modifier::BOLD),
+    )];
     // The badge keeps its place however long the connection details are.
-    let badge = " READ-ONLY ";
-    let width = (badge.len() as u16).min(area.width);
+    let badge = Line::from(vec![
+        Span::styled(" ● ", good()),
+        Span::styled("read-only ", subtle()),
+    ])
+    .style(Style::new().bg(t.surface));
+    let width = (badge.width() as u16).min(area.width);
     let [text_area, _, badge_area] = Layout::horizontal([
         Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(width),
     ])
     .areas(area);
+    if let (Screen::Workspace, Some(ws)) = (app.screen, &app.ws) {
+        let spec = ws.session.spec();
+        spans.extend([
+            Span::styled(format!("  {}", spec.name), bold()),
+            Span::raw("  "),
+            Span::styled(spec.engine.label(), Style::new().fg(t.engine(spec.engine))),
+            Span::styled(" · ", faint()),
+        ]);
+        let used: usize = spans.iter().map(Span::width).sum();
+        let room = (text_area.width as usize).saturating_sub(used);
+        let target = fit(&spec.target(), room, false);
+        spans.push(Span::styled(target.trim_end().to_string(), muted()));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), text_area);
-    frame.render_widget(
-        Paragraph::new(badge).style(Style::new().fg(Color::Black).bg(Color::Green)),
-        badge_area,
-    );
+    frame.render_widget(Paragraph::new(badge), badge_area);
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -241,67 +391,120 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             String::new()
         };
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(format!(" {} ", SPINNER[app.tick % SPINNER.len()]), accent()),
-            Span::raw(format!("{}…{waited}", job.label)),
-            Span::styled("   Esc cancels", dim()),
-        ])
+            Span::raw(format!("{}…", job.label)),
+            Span::styled(waited, muted()),
+            Span::raw("   "),
+        ];
+        spans.extend(hint_spans(&[("Esc", "cancel")]));
+        Line::from(spans)
     } else if let Some(toast) = &app.toast {
-        let style = if toast.error {
-            Style::new().fg(Color::Red)
+        let (mark, style) = if toast.error {
+            ("✗", bad())
         } else {
-            Style::new().fg(Color::Green)
+            ("✓", good())
         };
-        Line::from(Span::styled(format!(" {}", clean(&toast.text)), style))
+        Line::from(vec![
+            Span::styled(format!(" {mark} "), style.add_modifier(Modifier::BOLD)),
+            Span::styled(clean(&toast.text).into_owned(), style),
+        ])
     } else {
-        Line::from(Span::raw(format!(" {}", position_text(app))))
+        let mut spans = vec![Span::raw(" ")];
+        for (i, part) in position_text(app).into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("  ·  ", faint()));
+            }
+            spans.push(Span::styled(part, subtle()));
+        }
+        Line::from(spans)
     };
 
-    // Key hints go on the right when there is room next to the status text;
-    // in a narrow window the status wins and help is one key away.
+    // Key hints go on the right when there is room next to the status text.
+    // The least important go first, and help stays to the last.
     let room = area.width as usize;
-    let hints = [hint_text(app), "? help"]
-        .into_iter()
-        .find(|hints| !hints.is_empty() && left.width() + text_width(hints) + 3 <= room)
-        .unwrap_or("");
-    let hint_width = text_width(hints) as u16;
-    let [left_area, right_area] = if hints.is_empty() {
+    let width = |hints: &[(&str, &str)]| Line::from(hint_spans(hints)).width();
+    let mut shown = hints(app).to_vec();
+    let help = shown.last().is_some_and(|(key, _)| *key == "?");
+    while !shown.is_empty() && left.width() + width(&shown) + 3 > room {
+        let drop = if help && shown.len() > 1 {
+            shown.len() - 2
+        } else {
+            shown.len() - 1
+        };
+        shown.remove(drop);
+    }
+    let hint_width = width(&shown) as u16;
+    let [left_area, right_area] = if shown.is_empty() {
         [area, Rect { width: 0, ..area }]
     } else {
         Layout::horizontal([Constraint::Min(1), Constraint::Length(hint_width + 1)]).areas(area)
     };
     frame.render_widget(Paragraph::new(left), left_area);
-    frame.render_widget(Paragraph::new(hints).style(dim()), right_area);
+    frame.render_widget(Paragraph::new(Line::from(hint_spans(&shown))), right_area);
 }
 
-fn hint_text(app: &App) -> &'static str {
+fn hints(app: &App) -> Hints {
     match (&app.overlay, app.screen, &app.ws) {
-        (Overlay::Editor(_), ..) => "F5 run  Ctrl-L reset  Esc close",
-        (Overlay::Help { .. }, ..) => "",
-        (Overlay::None, Screen::Picker, _) => "Enter connect  / filter  r reload  ? help  q quit",
+        (Overlay::Editor(_), ..) => &[("F5", "run"), ("Ctrl-L", "reset"), ("Esc", "close")],
+        (Overlay::None, Screen::Picker, _) => &[
+            ("Enter", "connect"),
+            ("/", "filter"),
+            ("r", "reload"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
         (Overlay::None, Screen::Workspace, Some(ws)) => match ws.focus {
-            Focus::Sidebar if ws.side.filtering => "type to filter  Enter open  Esc clear",
-            Focus::Sidebar => "Enter open  / filter  Tab data  e SQL  ? help",
-            Focus::Main if ws.tab != 0 => "1 data  Enter row  y copy  ? help",
-            Focus::Main if ws.custom.is_some() => "e edit SQL  Backspace table  Enter row  ? help",
-            Focus::Main if ws.groups().is_some() => {
-                "Enter show rows  Backspace back  ] next  ? help"
+            Focus::Sidebar if ws.side.filtering => {
+                &[("", "type to filter"), ("Enter", "open"), ("Esc", "clear")]
             }
-            Focus::Main => "/ filter  s sort  d duplicates  Enter row  e SQL  ? help",
+            Focus::Sidebar => &[
+                ("Enter", "open"),
+                ("/", "filter"),
+                ("Tab", "data"),
+                ("e", "SQL"),
+                ("?", "help"),
+            ],
+            Focus::Main if ws.tab != 0 => &[
+                ("1", "data"),
+                ("Enter", "row"),
+                ("y", "copy"),
+                ("?", "help"),
+            ],
+            Focus::Main if ws.custom.is_some() => &[
+                ("e", "edit SQL"),
+                ("Backspace", "table"),
+                ("Enter", "row"),
+                ("?", "help"),
+            ],
+            Focus::Main if ws.groups().is_some() => &[
+                ("Enter", "show rows"),
+                ("Backspace", "back"),
+                ("]", "next"),
+                ("?", "help"),
+            ],
+            Focus::Main => &[
+                ("/", "filter"),
+                ("s", "sort"),
+                ("d", "duplicates"),
+                ("Enter", "row"),
+                ("e", "SQL"),
+                ("?", "help"),
+            ],
         },
-        _ => "",
+        _ => &[],
     }
 }
 
-fn position_text(app: &App) -> String {
+fn position_text(app: &App) -> Vec<String> {
     let Some(ws) = &app.ws else {
-        return String::new();
+        return Vec::new();
     };
     if app.screen != Screen::Workspace {
-        return String::new();
+        return Vec::new();
     }
     let Some(grid) = ws.grid() else {
-        return String::new();
+        return Vec::new();
     };
     let rows = grid.rows();
     let mut parts: Vec<String> = Vec::new();
@@ -365,74 +568,61 @@ fn position_text(app: &App) -> String {
         }
         parts.push(cursor);
     }
-    parts.join("  ·  ")
+    parts
 }
 
 // ---- connection picker ----------------------------------------------------
 
 fn draw_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let t = theme();
     let shown = app.picker_visible();
     let picker = &app.picker;
 
     if app.cfg.connections.is_empty() {
-        let mut lines = vec![
-            Line::from(Span::styled("No connections yet", bold())),
-            Line::default(),
-            Line::from(format!(
-                "Create {} with one block per database:",
-                app.cfg_path.display()
-            )),
-            Line::default(),
-        ];
-        for line in [
-            "[[connection]]",
-            "name = \"orders-prod\"",
-            "item = \"op://Engineering/Orders Prod DB\"",
-        ] {
-            lines.push(Line::from(Span::styled(format!("    {line}"), accent())));
-        }
-        lines.push(Line::default());
-        lines.push(Line::from(
-            "The item is a 1Password \"Database\" item with type, server, port, database,",
-        ));
-        lines.push(Line::from("username and password. Then press r to reload."));
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "kikkert --example-config prints a fuller example.",
-            dim(),
-        )));
-        if let Some(error) = &picker.error {
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                error.clone(),
-                Style::new().fg(Color::Red),
-            )));
-        }
-        // Room for the border, the padding and a wrapped config path.
-        let height = lines.len() as u16 + 6;
-        let block = Block::bordered().title(" Welcome ").border_style(accent());
-        let at = centered(area, 86, height);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(block.padding(ratatui::widgets::Padding::uniform(1)))
-                .wrap(Wrap { trim: false }),
-            at,
-        );
+        draw_welcome(frame, area, app);
         return;
     }
 
-    let error_lines = picker.error.as_ref().map_or(0, |e| {
-        let width = 86usize.min(area.width as usize).saturating_sub(4).max(10);
-        (text_width(e) / width + 2) as u16
-    });
+    // The card, and above it the name when there is room for both.
+    let width = 86.min(area.width);
+    let room = width.saturating_sub(4).max(10) as usize;
+    let error_lines = picker
+        .error
+        .as_ref()
+        .map_or(0, |e| (text_width(e) + 2).div_ceil(room) as u16 + 1);
     let filter_line = u16::from(picker.filtering || !picker.filter.is_empty());
-    let height = (shown.len() as u16 + filter_line + error_lines + 2).clamp(5, area.height);
-    let at = centered(area, 86, height);
-    let block = Block::bordered()
-        .title(format!(" Connections ({}) ", shown.len()))
-        .border_style(accent());
-    let inner = block.inner(at);
-    frame.render_widget(block, at);
+    let card_height = shown.len().max(1) as u16 + filter_line + error_lines + 4;
+    let hero = if area.height >= card_height + 6 { 3 } else { 0 };
+    let at = centered(area, width, card_height + hero);
+    let [hero_area, card_area] =
+        Layout::vertical([Constraint::Length(hero), Constraint::Min(3)]).areas(at);
+
+    if hero > 0 {
+        let name: String = "kikkert".chars().flat_map(|c| [c, ' ']).collect();
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    name.trim_end().to_string(),
+                    accent().add_modifier(Modifier::BOLD),
+                ),
+                Line::styled("a read-only window on your databases", muted()),
+            ])
+            .centered(),
+            hero_area,
+        );
+    }
+
+    let count = if shown.len() == app.cfg.connections.len() {
+        format!(" {} ", shown.len())
+    } else {
+        format!(" {} of {} ", shown.len(), app.cfg.connections.len())
+    };
+    let block = panel(true)
+        .title(panel_title("Connections", true))
+        .title(Line::styled(count, muted()).right_aligned())
+        .padding(Padding::uniform(1));
+    let inner = block.inner(card_area);
+    frame.render_widget(block, card_area);
 
     let [filter_area, list_area, error_area] = Layout::vertical([
         Constraint::Length(filter_line),
@@ -458,6 +648,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, app: &App) {
     let top = picker
         .selected
         .saturating_sub(visible_rows.saturating_sub(1));
+    let list_width = list_area.width as usize;
     let lines: Vec<Line> = shown
         .iter()
         .enumerate()
@@ -466,31 +657,38 @@ fn draw_picker(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(row, &i)| {
             let connection = &app.cfg.connections[i];
             let engine = connection.engine.as_deref().unwrap_or("");
-            let text = format!(
-                " {}  {}  {}",
-                fit(&connection.name, name_width, false),
-                fit(engine, 9, false),
-                connection.summary()
-            );
-            if row == picker.selected {
-                Line::from(Span::styled(
-                    fit(&text, list_area.width as usize, false),
-                    selected(),
-                ))
+            let engine_style = Engine::parse(engine)
+                .map_or_else(muted, |engine| Style::new().fg(t.engine(engine)));
+            let summary_width = list_width.saturating_sub(name_width + 15);
+            let is_selected = row == picker.selected;
+            let (bar, name_style, summary_style, line_style) = if is_selected {
+                (
+                    Span::styled("▌", accent()),
+                    highlight(true),
+                    subtle(),
+                    Style::new().bg(t.surface),
+                )
             } else {
-                Line::from(vec![
-                    Span::raw(format!(" {}  ", fit(&connection.name, name_width, false))),
-                    Span::styled(
-                        format!("{}  {}", fit(engine, 9, false), connection.summary()),
-                        dim(),
-                    ),
-                ])
-            }
+                (Span::raw(" "), Style::new(), muted(), Style::new())
+            };
+            Line::from(vec![
+                bar,
+                Span::styled(
+                    format!(" {}  ", fit(&connection.name, name_width, false)),
+                    name_style,
+                ),
+                Span::styled(format!("{}  ", fit(engine, 9, false)), engine_style),
+                Span::styled(
+                    fit(&connection.summary(), summary_width, false),
+                    summary_style,
+                ),
+            ])
+            .style(line_style)
         })
         .collect();
     if lines.is_empty() {
         frame.render_widget(
-            Paragraph::new(" Nothing matches the filter").style(dim()),
+            Paragraph::new("  Nothing matches the filter").style(null()),
             list_area,
         );
     } else {
@@ -498,25 +696,95 @@ fn draw_picker(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     if let Some(error) = &picker.error {
-        // Inset, so wrapped lines line up with the first.
-        let inset = Rect {
-            x: error_area.x + 1,
-            y: error_area.y + 1,
-            width: error_area.width.saturating_sub(2),
-            height: error_area.height.saturating_sub(1),
-        };
         frame.render_widget(
-            Paragraph::new(error.clone())
-                .style(Style::new().fg(Color::Red))
-                .wrap(Wrap { trim: true }),
-            inset,
+            Paragraph::new(Line::from(vec![
+                Span::styled("✗ ", bad().add_modifier(Modifier::BOLD)),
+                Span::styled(error.clone(), bad()),
+            ]))
+            .wrap(Wrap { trim: true }),
+            Rect {
+                y: error_area.y + 1,
+                height: error_area.height.saturating_sub(1),
+                ..error_area
+            },
         );
     }
+}
+
+/// The first run: no connections yet, so say how to add one.
+fn draw_welcome(frame: &mut Frame, area: Rect, app: &App) {
+    let t = theme();
+    let width = 86.min(area.width);
+    let room = width.saturating_sub(6) as usize;
+    let mut lines = vec![
+        Line::styled("No connections yet", bold()),
+        Line::default(),
+        Line::from(vec![
+            Span::raw("Create "),
+            Span::styled(app.cfg_path.display().to_string(), accent()),
+            Span::raw(" with one block per database:"),
+        ]),
+        Line::default(),
+    ];
+    let code = Style::new().bg(t.surface).fg(t.text);
+    for line in [
+        "",
+        "[[connection]]",
+        "name = \"orders-prod\"",
+        "item = \"op://Engineering/Orders Prod DB\"",
+        "",
+    ] {
+        let mut spans = vec![Span::styled("  ", code)];
+        match line.split_once(" = ") {
+            Some((key, value)) => spans.extend([
+                Span::styled(key, code.fg(t.accent)),
+                Span::styled(" = ", code.fg(t.subtle)),
+                Span::styled(value, code.fg(t.string)),
+            ]),
+            None => spans.push(Span::styled(line, code.fg(t.keyword))),
+        }
+        let used: usize = spans.iter().map(Span::width).sum();
+        spans.push(Span::styled(" ".repeat(room.saturating_sub(used)), code));
+        lines.push(Line::from(spans));
+    }
+    lines.extend([
+        Line::default(),
+        Line::from("The item is a 1Password \"Database\" item with type, server, port, database,"),
+        Line::from(vec![
+            Span::raw("username and password. Then press "),
+            Span::styled("r", accent()),
+            Span::raw(" to reload."),
+        ]),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("kikkert --example-config", accent()),
+            Span::styled(" prints a fuller example.", muted()),
+        ]),
+    ]);
+    if let Some(error) = &app.picker.error {
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            Span::styled("✗ ", bad().add_modifier(Modifier::BOLD)),
+            Span::styled(error.clone(), bad()),
+        ]));
+    }
+    // Room for the border, the padding and a wrapped config path.
+    let height = lines.len() as u16 + 6;
+    let block = panel(true)
+        .title(panel_title("Welcome to kikkert", true))
+        .padding(Padding::symmetric(2, 1));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        centered(area, width, height),
+    );
 }
 
 // ---- workspace ------------------------------------------------------------
 
 fn draw_workspace(frame: &mut Frame, area: Rect, app: &mut App) {
+    let tick = app.tick;
     let Some(ws) = &mut app.ws else { return };
     let side_width = (area.width / 4)
         .clamp(20, 40)
@@ -524,13 +792,7 @@ fn draw_workspace(frame: &mut Frame, area: Rect, app: &mut App) {
     let [side, main] =
         Layout::horizontal([Constraint::Length(side_width), Constraint::Min(10)]).areas(area);
 
-    let editing = matches!(app.overlay, Overlay::Editor(_));
-    draw_sidebar(
-        frame,
-        side,
-        ws,
-        !editing && matches!(app.overlay, Overlay::None),
-    );
+    draw_sidebar(frame, side, ws, matches!(app.overlay, Overlay::None));
 
     // The SQL on top: read-only normally, an editor while editing.
     let top_height = match &app.overlay {
@@ -540,20 +802,28 @@ fn draw_workspace(frame: &mut Frame, area: Rect, app: &mut App) {
         _ => (ws.sql.lines().count() as u16 + 2).clamp(3, 9),
     }
     .min(main.height.saturating_sub(4));
-    let [sql_area, tabs_area, pane_area] = Layout::vertical([
-        Constraint::Length(top_height),
-        Constraint::Length(1),
-        Constraint::Min(1),
-    ])
-    .areas(main);
+    let [sql_area, pane_area] =
+        Layout::vertical([Constraint::Length(top_height), Constraint::Min(1)]).areas(main);
 
     match &app.overlay {
         Overlay::Editor(editor) => draw_editor(frame, sql_area, editor),
         _ => draw_sql(frame, sql_area, ws),
     }
-    draw_tabs(frame, tabs_area, ws);
 
+    // The data and structure tabs share one box, with the tabs on its edge.
+    // What the box shows goes in the corner if the tabs leave room for it.
     let focused = ws.focus == Focus::Main && matches!(app.overlay, Overlay::None);
+    let tabs = tab_line(ws, focused);
+    let context = context_line(ws);
+    let fits = tabs.width() + context.width() + 4 <= pane_area.width as usize;
+    let mut block = panel(focused).title(tabs);
+    if fits {
+        block = block.title(context.right_aligned());
+    }
+    let inner = block.inner(pane_area);
+    frame.render_widget(block, pane_area);
+    let text_area = inner.inner(Margin::new(1, 0));
+
     let (sorts, marked) = match (&ws.table, ws.builder_active() && ws.groups().is_none()) {
         (Some(table), true) => (
             table
@@ -566,52 +836,128 @@ fn draw_workspace(frame: &mut Frame, area: Rect, app: &mut App) {
         ),
         _ => (Vec::new(), BTreeSet::new()),
     };
-    let empty_hint = if ws.objects.is_empty() {
-        "This login cannot see any tables here.\n\nPress e to write SQL."
+    let empty_hint: Vec<Line<'static>> = if ws.objects.is_empty() {
+        vec![
+            Line::styled("This login cannot see any tables here.", subtle()),
+            Line::default(),
+            Line::from(vec![
+                Span::styled("Press ", muted()),
+                Span::styled("e", accent()),
+                Span::styled(" to write SQL.", muted()),
+            ]),
+        ]
     } else {
-        "Pick a table on the left and press Enter.\n\nt finds a table by name, e opens the SQL editor, ? lists every key."
+        vec![
+            Line::from(vec![
+                Span::styled("Pick a table on the left and press ", subtle()),
+                Span::styled("Enter", accent()),
+            ]),
+            Line::default(),
+            Line::from(vec![
+                Span::styled("t", accent()),
+                Span::styled(" finds a table  ·  ", muted()),
+                Span::styled("e", accent()),
+                Span::styled(" writes SQL  ·  ", muted()),
+                Span::styled("?", accent()),
+                Span::styled(" lists every key", muted()),
+            ]),
+        ]
     };
     match ws.pane_mut() {
-        Pane::Grid(grid) => draw_grid(frame, pane_area, grid, focused, &sorts, &marked),
-        Pane::Loading => {
-            frame.render_widget(Paragraph::new("\n  Loading…").style(dim()), pane_area)
-        }
-        Pane::Empty => frame.render_widget(
-            Paragraph::new(format!("\n{empty_hint}"))
-                .style(dim())
-                .alignment(Alignment::Center)
-                .wrap(Wrap { trim: true }),
-            pane_area,
+        Pane::Grid(grid) => draw_grid(frame, pane_area, inner, grid, focused, &sorts, &marked),
+        Pane::Loading => draw_centered(
+            frame,
+            text_area,
+            vec![Line::from(vec![
+                Span::styled(format!("{} ", SPINNER[tick % SPINNER.len()]), accent()),
+                Span::styled("Loading…", muted()),
+            ])],
         ),
+        Pane::Empty => draw_centered(frame, text_area, empty_hint),
         Pane::Error(error) => {
-            let lines = vec![
+            let mut text = Text::from(vec![
                 Line::default(),
-                Line::from(Span::styled(" Could not run this", bold().fg(Color::Red))),
+                Line::from(vec![
+                    Span::styled("✗ ", bad().add_modifier(Modifier::BOLD)),
+                    Span::styled("Could not run this", bad().add_modifier(Modifier::BOLD)),
+                ]),
                 Line::default(),
-            ];
-            let mut text = ratatui::text::Text::from(lines);
+            ]);
             for line in error.lines() {
-                text.push_line(Line::from(format!(" {line}")));
+                text.push_line(Line::from(line.to_string()));
             }
             text.push_line(Line::default());
-            text.push_line(Line::from(Span::styled(
-                " e edits the SQL, F lists the filters, Backspace goes back.",
-                dim(),
-            )));
-            frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), pane_area);
+            text.push_line(Line::from(hint_spans(&[
+                ("e", "edits the SQL"),
+                ("F", "lists the filters"),
+                ("Backspace", "goes back"),
+            ])));
+            frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), text_area);
         }
     }
 }
 
+/// The tabs, for the top edge of the data box.
+fn tab_line(ws: &Workspace, focused: bool) -> Line<'static> {
+    let t = theme();
+    let titles = ws.tab_titles();
+    if titles.len() == 1 {
+        return Line::from(panel_title(titles[0], focused));
+    }
+    let mut spans = vec![Span::raw(" ")];
+    for (i, title) in titles.iter().enumerate() {
+        let (number, name) = if i == ws.tab {
+            let tab = Style::new().bg(t.surface);
+            let name = if focused {
+                tab.fg(t.accent).add_modifier(Modifier::BOLD)
+            } else {
+                tab.fg(t.text)
+            };
+            (tab.fg(t.muted), name)
+        } else {
+            (faint(), muted())
+        };
+        spans.push(Span::styled(format!(" {} ", i + 1), number));
+        spans.push(Span::styled(format!("{title} "), name));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
+/// What the data box shows, for its top right corner.
+fn context_line(ws: &Workspace) -> Line<'static> {
+    let special = |text: String| Line::styled(format!(" {text} "), accent());
+    if ws.custom.is_some() {
+        return special("hand-written SQL".to_string());
+    }
+    let Some(table) = &ws.table else {
+        return Line::default();
+    };
+    match &table.query.mode {
+        Mode::Rows => Line::from(vec![
+            Span::styled(format!(" {}", table.object.display_name()), subtle()),
+            Span::styled(format!(" · {} ", table.object.kind_label), muted()),
+        ]),
+        Mode::Groups {
+            columns,
+            duplicates_only: true,
+        } => special(format!("duplicates of {}", columns.join(", "))),
+        Mode::Groups { columns, .. } => special(format!("values of {}", columns.join(", "))),
+    }
+}
+
 fn draw_sidebar(frame: &mut Frame, area: Rect, ws: &mut Workspace, active: bool) {
+    let t = theme();
     let visible = ws.visible();
     let focused = active && ws.focus == Focus::Sidebar;
-    let title = if visible.len() == ws.objects.len() {
-        format!(" Tables ({}) ", ws.objects.len())
+    let count = if visible.len() == ws.objects.len() {
+        format!(" {} ", ws.objects.len())
     } else {
-        format!(" Tables ({}/{}) ", visible.len(), ws.objects.len())
+        format!(" {} of {} ", visible.len(), ws.objects.len())
     };
-    let block = Block::bordered().title(title).border_style(border(focused));
+    let block = panel(focused)
+        .title(panel_title("Tables", focused))
+        .title(Line::styled(count, muted()).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -620,8 +966,8 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, ws: &mut Workspace, active: bool)
         Layout::vertical([Constraint::Length(filter_line), Constraint::Min(0)]).areas(inner);
     if filter_line == 1 {
         let [slash, field] =
-            Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).areas(filter_area);
-        frame.render_widget(Paragraph::new("/").style(accent()), slash);
+            Layout::horizontal([Constraint::Length(3), Constraint::Min(1)]).areas(filter_area);
+        frame.render_widget(Paragraph::new(" /").style(accent()), slash);
         draw_input(
             frame,
             field,
@@ -645,32 +991,42 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, ws: &mut Workspace, active: bool)
         if schema != Some(&object.schema) {
             schema = Some(&object.schema);
             if let Some(name) = &object.schema {
-                lines.push(Line::from(Span::styled(
-                    fit(name, width, false),
-                    dim().add_modifier(Modifier::BOLD),
-                )));
+                lines.push(Line::styled(
+                    fit(&format!(" {name}"), width, false),
+                    muted().add_modifier(Modifier::BOLD),
+                ));
             }
         }
-        let marker = if object.kind == ObjectKind::View {
-            "◇"
-        } else {
-            " "
-        };
-        let text = fit(&format!(" {marker} {}", object.name), width, false);
         let is_open = open.as_deref() == Some(object.display_name().as_str());
-        let style = if position == ws.side.selected {
-            selected_line = lines.len();
-            if focused {
-                selected()
-            } else {
-                Style::new().add_modifier(Modifier::REVERSED)
-            }
-        } else if is_open {
-            accent().add_modifier(Modifier::BOLD)
+        let is_selected = position == ws.side.selected;
+        let glyph = if object.kind == ObjectKind::View {
+            Span::styled("◇", Style::new().fg(t.keyword))
         } else {
-            Style::new()
+            Span::raw(" ")
         };
-        lines.push(Line::from(Span::styled(text, style)));
+        let name = fit(&object.name, width.saturating_sub(3), false);
+        let line = if is_selected {
+            selected_line = lines.len();
+            let bar = if focused { "▌" } else { " " };
+            Line::from(vec![
+                Span::styled(bar, accent()),
+                glyph,
+                Span::styled(format!(" {name}"), highlight(focused)),
+            ])
+            .style(Style::new().bg(t.surface))
+        } else {
+            let style = if is_open {
+                accent().add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            };
+            Line::from(vec![
+                Span::raw(" "),
+                glyph,
+                Span::styled(format!(" {name}"), style),
+            ])
+        };
+        lines.push(line);
     }
 
     let height = list_area.height as usize;
@@ -684,66 +1040,80 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, ws: &mut Workspace, active: bool)
 
     if lines.is_empty() {
         let message = if ws.objects.is_empty() {
-            " (no tables)"
+            "  no tables"
         } else {
-            " (no match)"
+            "  no match"
         };
-        frame.render_widget(Paragraph::new(message).style(dim()), list_area);
+        frame.render_widget(Paragraph::new(message).style(null()), list_area);
     } else {
+        let total = lines.len();
         let shown: Vec<Line> = lines
             .into_iter()
             .skip(ws.side.offset)
             .take(height)
             .collect();
         frame.render_widget(Paragraph::new(shown), list_area);
+        let track = Rect {
+            x: area.right().saturating_sub(1),
+            width: 1,
+            ..list_area
+        };
+        scrollbar(frame, track, ws.side.offset, height, total, focused);
     }
 }
 
 fn draw_sql(frame: &mut Frame, area: Rect, ws: &Workspace) {
-    let block = Block::bordered()
-        .title(" SQL ")
-        .title_bottom(Line::from(" e to edit ").right_aligned())
-        .border_style(dim());
+    let block = panel(false)
+        .title(panel_title("SQL", false))
+        .title_bottom(hint_title(&[("e", "edit")]))
+        .padding(Padding::horizontal(1));
     let text = if ws.sql.is_empty() {
-        Paragraph::new("Nothing has run yet").style(dim())
+        Paragraph::new("Nothing has run yet").style(null())
     } else {
-        Paragraph::new(ws.sql.clone()).wrap(Wrap { trim: false })
+        Paragraph::new(syntax::sql(&ws.sql)).wrap(Wrap { trim: false })
     };
     frame.render_widget(text.block(block), area);
 }
 
 fn draw_editor(frame: &mut Frame, area: Rect, editor: &Editor) {
-    let block = Block::bordered()
-        .title(" SQL editor ")
+    let t = theme();
+    let (row, col) = editor.cursor();
+    let block = panel(true)
+        .title(panel_title("SQL editor", true))
         .title_bottom(
-            Line::from(" F5 or Ctrl-R runs · Ctrl-L resets · Esc closes ").right_aligned(),
-        )
-        .border_style(accent());
+            Line::styled(format!(" Ln {}, Col {} ", row + 1, col + 1), muted()).right_aligned(),
+        );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 8 || inner.height == 0 {
         return;
     }
 
-    const GUTTER: u16 = 4;
-    let (row, col) = editor.cursor();
+    const GUTTER: u16 = 5;
     let height = inner.height as usize;
     let room = (inner.width - GUTTER) as usize;
     let top = (row + 1).saturating_sub(height);
     let left = (col + 1).saturating_sub(room);
 
-    let lines: Vec<Line> = editor
-        .lines()
+    // The line being edited sits on a raised band.
+    frame.buffer_mut().set_style(
+        Rect {
+            y: inner.y + (row - top) as u16,
+            height: 1,
+            ..inner
+        },
+        Style::new().bg(t.surface),
+    );
+    let lines: Vec<Line> = syntax::sql(&editor.text())
         .iter()
         .enumerate()
         .skip(top)
         .take(height)
         .map(|(i, line)| {
-            let shown: String = line.chars().skip(left).take(room).collect();
-            Line::from(vec![
-                Span::styled(format!("{:>3} ", i + 1), dim()),
-                Span::raw(shown),
-            ])
+            let number = if i == row { accent() } else { faint() };
+            let mut spans = vec![Span::styled(format!("{:>4} ", i + 1), number)];
+            spans.extend(crop(line, left, room).spans);
+            Line::from(spans)
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
@@ -759,65 +1129,31 @@ fn draw_editor(frame: &mut Frame, area: Rect, editor: &Editor) {
     ));
 }
 
-fn draw_tabs(frame: &mut Frame, area: Rect, ws: &Workspace) {
-    let mut spans = vec![Span::raw(" ")];
-    for (i, title) in ws.tab_titles().iter().enumerate() {
-        let label = format!(" {} {title} ", i + 1);
-        spans.push(if i == ws.tab {
-            Span::styled(label, selected())
-        } else {
-            Span::styled(label, dim())
-        });
-        spans.push(Span::raw(" "));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-
-    let context = if ws.custom.is_some() {
-        "hand-written SQL".to_string()
-    } else {
-        match &ws.table {
-            Some(table) => match &table.query.mode {
-                Mode::Rows => format!(
-                    "{} · {}",
-                    table.object.display_name(),
-                    table.object.kind_label
-                ),
-                Mode::Groups {
-                    columns,
-                    duplicates_only: true,
-                } => {
-                    format!("duplicates of {}", columns.join(", "))
-                }
-                Mode::Groups { columns, .. } => format!("values of {}", columns.join(", ")),
-            },
-            None => String::new(),
-        }
-    };
-    frame.render_widget(
-        Paragraph::new(format!("{context} "))
-            .style(accent())
-            .alignment(Alignment::Right),
-        area,
-    );
-}
-
+/// The rows of a result. `area` is inside `frame_area`'s border, where the
+/// scroll thumbs go.
 fn draw_grid(
     frame: &mut Frame,
+    frame_area: Rect,
     area: Rect,
     grid: &mut Grid,
     focused: bool,
     sorts: &[(String, Dir)],
     marked: &BTreeSet<String>,
 ) {
+    let t = theme();
     if area.height < 2 || area.width < 6 {
         return;
     }
     let rows = grid.rows();
     let cols = grid.cols();
     if cols == 0 {
-        frame.render_widget(
-            Paragraph::new("\n  The statement ran and returned nothing to show.").style(dim()),
+        draw_centered(
+            frame,
             area,
+            vec![Line::styled(
+                "The statement ran and returned nothing to show.",
+                muted(),
+            )],
         );
         return;
     }
@@ -846,8 +1182,26 @@ fn draw_grid(
     }
 
     let buffer = frame.buffer_mut();
+    // The header on a band of its own, and the cursor row raised across
+    // the whole width, past the last column.
+    buffer.set_style(
+        Rect { height: 1, ..area },
+        Style::new().bg(t.surface).fg(t.subtle),
+    );
+    if rows > 0 && grid.row >= grid.row_off && grid.row - grid.row_off < body {
+        buffer.set_style(
+            Rect {
+                y: area.y + 1 + (grid.row - grid.row_off) as u16,
+                height: 1,
+                ..area
+            },
+            Style::new().bg(t.surface).fg(t.text),
+        );
+    }
+
     let mut x = area.x;
     let right_edge = area.x + area.width;
+    let mut last_shown = grid.col_off;
     for c in grid.col_off..cols {
         if x >= right_edge {
             break;
@@ -859,6 +1213,9 @@ fn draw_grid(
         }
         // A column cut off by the edge is clipped with an ellipsis.
         let width = width_of(c).min(left - 2);
+        if width == width_of(c) {
+            last_shown = c;
+        }
 
         // Header: name, a mark for Space-selected columns, the sort arrow.
         let mut name = column.name.clone();
@@ -878,9 +1235,11 @@ fn draw_grid(
             };
         }
         let header_style = if c == grid.col && focused {
-            Style::new()
-                .fg(ACCENT)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            accent().add_modifier(Modifier::BOLD)
+        } else if marked.contains(&column.name) {
+            Style::new().fg(t.warn).add_modifier(Modifier::BOLD)
+        } else if sorts.iter().any(|(sorted, _)| *sorted == column.name) {
+            Style::new().fg(t.text).add_modifier(Modifier::BOLD)
         } else {
             bold()
         };
@@ -899,22 +1258,16 @@ fn draw_grid(
                 break;
             }
             let value = grid.result.rows[r].get(c).and_then(|v| v.as_deref());
-            let on_row = r == grid.row;
-            let on_cell = on_row && c == grid.col;
-            let mut style = match value {
-                None => dim().add_modifier(Modifier::ITALIC),
-                Some(_) => Style::new(),
-            };
-            if on_cell && focused {
-                style = selected();
+            let on_cell = r == grid.row && c == grid.col;
+            let style = if on_cell && focused {
+                cursor()
             } else if on_cell {
-                style = style.add_modifier(Modifier::REVERSED);
-            } else if on_row {
-                style = style.bg(Color::Indexed(238)).fg(match value {
-                    None => Color::Gray,
-                    Some(_) => Color::White,
-                });
-            }
+                Style::new().bg(t.raised).fg(t.text)
+            } else if value.is_none() {
+                null()
+            } else {
+                Style::new()
+            };
             let text = fit(
                 value.unwrap_or("NULL"),
                 width,
@@ -922,56 +1275,79 @@ fn draw_grid(
             );
             buffer.set_stringn(x, y, format!(" {text} "), left, style);
             if left > width + 2 {
-                buffer.set_stringn(x + width as u16 + 2, y, "│", 1, dim());
+                buffer.set_stringn(x + width as u16 + 2, y, "│", 1, faint());
             }
         }
         if left > width + 2 {
-            buffer.set_stringn(x + width as u16 + 2, area.y, "│", 1, dim());
+            buffer.set_stringn(x + width as u16 + 2, area.y, "│", 1, faint());
         }
         x += width as u16 + 3;
     }
 
     if rows == 0 {
-        frame.render_widget(
-            Paragraph::new("  No rows.").style(dim()),
+        draw_centered(
+            frame,
             Rect {
                 y: area.y + 1,
-                height: 1,
+                height: area.height - 1,
                 ..area
             },
+            vec![Line::styled("No rows", null())],
         );
     }
+
+    // Thumbs on the right and bottom edges show where the view is.
+    let right = Rect {
+        x: frame_area.right().saturating_sub(1),
+        y: area.y + 1,
+        width: 1,
+        height: area.height - 1,
+    };
+    scrollbar(frame, right, grid.row_off, body, rows, focused);
+    let bottom = Rect {
+        y: frame_area.bottom().saturating_sub(1),
+        height: 1,
+        ..area
+    };
+    let shown = last_shown + 1 - grid.col_off;
+    scrollbar(frame, bottom, grid.col_off, shown, cols, focused);
 }
 
 // ---- overlays -------------------------------------------------------------
 
-fn popup(frame: &mut Frame, area: Rect, title: &str, hint: &str) -> Rect {
+fn popup(frame: &mut Frame, area: Rect, title: &str, hints: &[(&str, &str)]) -> Rect {
+    let t = theme();
     frame.render_widget(Clear, area);
     let block = Block::bordered()
-        .title(format!(" {title} "))
-        .title_bottom(Line::from(format!(" {hint} ")).right_aligned())
-        .border_style(accent());
+        .border_type(BorderType::Rounded)
+        .border_style(accent())
+        .style(Style::new().bg(t.popup).fg(t.text))
+        .title(panel_title(title, true))
+        .title_bottom(hint_title(hints))
+        .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     inner
 }
 
 fn draw_filter(frame: &mut Frame, area: Rect, dialog: &FilterDialog, ws: &Workspace) {
+    let t = theme();
     let Some(table) = &ws.table else { return };
     let engine = ws.session.engine();
     let columns = &table.query.columns;
     let matches = dialog.matches(columns);
-    let at = centered(area, 72, 17);
+    let at = centered(area, 74, 18);
     let inner = popup(
         frame,
         at,
         "Filter",
-        "Tab next field · Enter apply · Esc cancel",
+        &[("Tab", "next field"), ("Enter", "apply"), ("Esc", "cancel")],
     );
-    if inner.height < 6 {
+    if inner.height < 7 {
         return;
     }
-    let [column_area, op_area, value_area, _, detail_area] = Layout::vertical([
+    let [_, column_area, op_area, value_area, _, detail_area] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -980,74 +1356,64 @@ fn draw_filter(frame: &mut Frame, area: Rect, dialog: &FilterDialog, ws: &Worksp
     ])
     .areas(inner);
 
+    let field = Style::new().bg(t.surface).fg(t.text);
     let row = |frame: &mut Frame, area: Rect, label: &str, focused: bool| -> Rect {
-        let [label_area, field] =
-            Layout::horizontal([Constraint::Length(11), Constraint::Min(1)]).areas(area);
-        let style = if focused {
-            accent().add_modifier(Modifier::BOLD)
+        let [label_area, field_area] =
+            Layout::horizontal([Constraint::Length(10), Constraint::Min(1)]).areas(area);
+        let (pointer, style) = if focused {
+            ("› ", accent().add_modifier(Modifier::BOLD))
         } else {
-            dim()
+            ("  ", muted())
         };
-        let pointer = if focused { "›" } else { " " };
         frame.render_widget(
             Paragraph::new(format!("{pointer}{label}")).style(style),
             label_area,
         );
-        field
+        field_area
     };
 
-    let field = row(
-        frame,
-        column_area,
-        " Column",
-        dialog.focus == FilterField::Column,
-    );
+    let focus = dialog.focus;
+    let area = row(frame, column_area, "Column", focus == FilterField::Column);
+    frame.render_widget(Paragraph::new("").style(field), area);
     draw_input(
         frame,
-        field,
+        area.inner(Margin::new(1, 0)),
         &dialog.column,
-        dialog.focus == FilterField::Column,
-        Style::new(),
+        focus == FilterField::Column,
+        field,
     );
 
-    let field = row(
-        frame,
-        op_area,
-        " Match",
-        dialog.focus == FilterField::Operator,
-    );
-    let op_style = if dialog.focus == FilterField::Operator {
-        selected()
+    let area = row(frame, op_area, "Match", focus == FilterField::Operator);
+    let op_style = if focus == FilterField::Operator {
+        cursor()
     } else {
-        Style::new()
+        field
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(format!(" {} ", dialog.op().label()), op_style),
-            Span::styled("   ↑↓ changes", dim()),
+            Span::raw("  "),
+            Span::styled("↑↓", accent()),
+            Span::styled(" changes", muted()),
         ])),
-        field,
+        area,
     );
 
-    let field = row(
-        frame,
-        value_area,
-        " Value",
-        dialog.focus == FilterField::Value,
-    );
+    let area = row(frame, value_area, "Value", focus == FilterField::Value);
     if dialog.op().needs_value() {
+        frame.render_widget(Paragraph::new("").style(field), area);
         draw_input(
             frame,
-            field,
+            area.inner(Margin::new(1, 0)),
             &dialog.value,
-            dialog.focus == FilterField::Value,
-            Style::new(),
+            focus == FilterField::Value,
+            field,
         );
     } else {
-        frame.render_widget(Paragraph::new("(not needed)").style(dim()), field);
+        frame.render_widget(Paragraph::new("not needed").style(null()), area);
     }
 
-    match dialog.focus {
+    match focus {
         FilterField::Column => {
             let pick = dialog.pick.min(matches.len().saturating_sub(1));
             let height = detail_area.height as usize;
@@ -1066,26 +1432,25 @@ fn draw_filter(frame: &mut Frame, area: Rect, dialog: &FilterDialog, ws: &Worksp
                 .map(|(i, column)| {
                     let name = fit(&column.name, name_width, false);
                     let key = if column.primary_key { " PK" } else { "" };
+                    let text = fit(
+                        &format!("  {name}  {}{key}", column.type_name),
+                        detail_area.width as usize,
+                        false,
+                    );
                     if i == pick {
-                        Line::from(Span::styled(
-                            fit(
-                                &format!(" {name}  {}{key}", column.type_name),
-                                detail_area.width as usize,
-                                false,
-                            ),
-                            selected(),
-                        ))
+                        Line::styled(text, highlight(true))
                     } else {
                         Line::from(vec![
-                            Span::raw(format!(" {name}  ")),
-                            Span::styled(format!("{}{key}", column.type_name), dim()),
+                            Span::raw(format!("  {name}  ")),
+                            Span::styled(column.type_name.clone(), muted()),
+                            Span::styled(key, Style::new().fg(t.warn)),
                         ])
                     }
                 })
                 .collect();
             if lines.is_empty() {
                 frame.render_widget(
-                    Paragraph::new(" No column matches").style(dim()),
+                    Paragraph::new("  No column matches").style(null()),
                     detail_area,
                 );
             } else {
@@ -1096,10 +1461,11 @@ fn draw_filter(frame: &mut Frame, area: Rect, dialog: &FilterDialog, ws: &Worksp
             let lines: Vec<Line> = Op::ALL
                 .iter()
                 .map(|op| {
+                    let text = format!("  {} ", op.label());
                     if *op == dialog.op() {
-                        Line::from(Span::styled(format!(" {} ", op.label()), selected()))
+                        Line::styled(text, highlight(true))
                     } else {
-                        Line::from(Span::raw(format!(" {} ", op.label())))
+                        Line::styled(text, subtle())
                     }
                 })
                 .collect();
@@ -1117,17 +1483,19 @@ fn draw_filter(frame: &mut Frame, area: Rect, dialog: &FilterDialog, ws: &Worksp
                     },
                 )
             });
-            let mut lines = vec![Line::from(Span::styled(" Adds to the query:", dim()))];
+            let mut lines = vec![Line::styled("  Adds to the query", muted())];
             if let Some(sql) = preview {
                 let keyword = if table.query.filters.is_empty() {
                     "WHERE"
                 } else {
                     "AND"
                 };
-                lines.push(Line::from(Span::styled(
-                    format!(" {keyword} {sql}"),
-                    accent(),
-                )));
+                lines.push(Line::default());
+                for line in syntax::sql(&format!("{keyword} {sql}")) {
+                    let mut spans = vec![Span::raw("  ")];
+                    spans.extend(line.spans);
+                    lines.push(Line::from(spans));
+                }
             }
             frame.render_widget(
                 Paragraph::new(lines).wrap(Wrap { trim: false }),
@@ -1138,35 +1506,70 @@ fn draw_filter(frame: &mut Frame, area: Rect, dialog: &FilterDialog, ws: &Worksp
 }
 
 fn draw_filters(frame: &mut Frame, area: Rect, selected_index: usize, ws: &Workspace) {
+    let t = theme();
     let Some(table) = &ws.table else { return };
     let filters = &table.query.filters;
-    let at = centered(area, 72, (filters.len() as u16 + 4).clamp(6, 20));
+    let at = centered(area, 74, (filters.len() as u16 + 4).clamp(7, 20));
     let inner = popup(
         frame,
         at,
         "Filters",
-        "d remove · c clear all · a add · Esc close",
+        &[
+            ("d", "remove"),
+            ("c", "clear all"),
+            ("a", "add"),
+            ("Esc", "close"),
+        ],
     );
     if filters.is_empty() {
-        frame.render_widget(
-            Paragraph::new("\n No filters. Press / on the data to add one.").style(dim()),
+        draw_centered(
+            frame,
             inner,
+            vec![Line::from(vec![
+                Span::styled("No filters. Press ", muted()),
+                Span::styled("/", accent()),
+                Span::styled(" on the data to add one.", muted()),
+            ])],
         );
         return;
     }
+    let width = inner.width as usize;
     let lines: Vec<Line> = filters
         .iter()
         .enumerate()
         .map(|(i, filter)| {
-            let text = fit(
-                &format!(" {}", filter.describe()),
-                inner.width as usize,
-                false,
-            );
-            if i == selected_index.min(filters.len() - 1) {
-                Line::from(Span::styled(text, selected()))
+            let selected = i == selected_index.min(filters.len() - 1);
+            let mut spans = vec![
+                Span::raw(" "),
+                Span::styled(filter.column.clone(), bold()),
+                Span::styled(
+                    format!(" {}", filter.op.label()),
+                    Style::new().fg(t.keyword),
+                ),
+            ];
+            if filter.op.needs_value() {
+                spans.push(Span::styled(
+                    format!(" \"{}\"", clean(&filter.value)),
+                    Style::new().fg(t.string),
+                ));
+            }
+            let used: usize = spans.iter().map(Span::width).sum();
+            if used > width {
+                // Too long to colour piece by piece; clip it whole.
+                return Line::styled(fit(&format!(" {}", filter.describe()), width, false), {
+                    if selected {
+                        highlight(true)
+                    } else {
+                        Style::new()
+                    }
+                });
+            }
+            spans.push(Span::raw(" ".repeat(width - used)));
+            let line = Line::from(spans);
+            if selected {
+                line.style(Style::new().bg(t.surface))
             } else {
-                Line::from(text)
+                line
             }
         })
         .collect();
@@ -1176,6 +1579,7 @@ fn draw_filters(frame: &mut Frame, area: Rect, selected_index: usize, ws: &Works
 /// One row shown vertically: every column on its own line, with the full
 /// value of the selected one below.
 fn draw_record(frame: &mut Frame, area: Rect, record: &mut Record, grid: &Grid) {
+    let t = theme();
     let Some(row) = grid.result.rows.get(grid.row) else {
         return;
     };
@@ -1187,7 +1591,13 @@ fn draw_record(frame: &mut Frame, area: Rect, record: &mut Record, grid: &Grid) 
         frame,
         at,
         &title,
-        "↑↓ field · ←→ row · y copy · = filter · Esc close",
+        &[
+            ("↑↓", "field"),
+            ("←→", "row"),
+            ("y", "copy"),
+            ("=", "filter"),
+            ("Esc", "close"),
+        ],
     );
     if inner.height < 4 {
         return;
@@ -1228,62 +1638,86 @@ fn draw_record(frame: &mut Frame, area: Rect, record: &mut Record, grid: &Grid) 
             let value = row.get(i).and_then(|v| v.as_deref());
             let name = fit(&column.name, name_width, false);
             let text = fit(value.unwrap_or("NULL"), value_width, false);
+            let value_style = if value.is_none() {
+                null()
+            } else {
+                Style::new()
+            };
             if i == record.field {
-                Line::from(Span::styled(format!(" {name}  {text} "), selected()))
+                Line::from(vec![
+                    Span::styled(format!(" {name}  "), highlight(true)),
+                    Span::styled(format!("{text} "), value_style.fg(t.text)),
+                ])
+                .style(Style::new().bg(t.surface))
             } else {
                 Line::from(vec![
-                    Span::styled(format!(" {name}  "), accent()),
-                    Span::styled(
-                        text,
-                        if value.is_none() {
-                            dim().add_modifier(Modifier::ITALIC)
-                        } else {
-                            Style::new()
-                        },
-                    ),
+                    Span::styled(format!(" {name}  "), muted()),
+                    Span::styled(text, value_style),
                 ])
             }
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), list_area);
+    let track = Rect {
+        x: at.right().saturating_sub(1),
+        width: 1,
+        ..list_area
+    };
+    scrollbar(frame, track, record.offset, shown, cols, true);
 
     let column = &grid.result.columns[record.field];
     let value = row.get(record.field).and_then(|v| v.as_deref());
-    let mut heading = format!("─ {} ", column.name);
+    let mut heading = vec![
+        Span::styled("── ", faint()),
+        Span::styled(column.name.clone(), accent().add_modifier(Modifier::BOLD)),
+    ];
     if !column.type_name.is_empty() {
-        heading.push_str(&format!("({}) ", column.type_name));
+        heading.push(Span::styled(format!("  {}", column.type_name), muted()));
     }
     if let Some(value) = value {
         let count = value.chars().count();
-        heading.push_str(&format!(
-            "· {} char{} ",
-            thousands(count as u64),
-            if count == 1 { "" } else { "s" }
+        heading.push(Span::styled(
+            format!(
+                "  {} char{}",
+                thousands(count as u64),
+                if count == 1 { "" } else { "s" }
+            ),
+            muted(),
         ));
     }
-    let rule = format!(
-        "{heading}{}",
-        "─".repeat((rule_area.width as usize).saturating_sub(text_width(&heading)))
-    );
-    frame.render_widget(Paragraph::new(rule).style(dim()), rule_area);
+    let used: usize = heading.iter().map(Span::width).sum::<usize>() + 1;
+    heading.push(Span::styled(
+        format!(
+            " {}",
+            "─".repeat((rule_area.width as usize).saturating_sub(used))
+        ),
+        faint(),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(heading)), rule_area);
 
+    let value_area = Rect {
+        y: value_area.y + 1,
+        height: value_area.height.saturating_sub(1),
+        ..value_area
+    };
     let body = match value {
-        None => Paragraph::new("NULL").style(dim().add_modifier(Modifier::ITALIC)),
+        None => Paragraph::new("NULL").style(null()),
         Some(value) => Paragraph::new(pretty(value)).wrap(Wrap { trim: false }),
     };
     frame.render_widget(body.scroll((record.scroll, 0)), value_area);
 }
 
-/// JSON reads better indented; everything else is shown as it is.
-fn pretty(value: &str) -> String {
+/// JSON reads better indented and coloured; everything else is shown as it
+/// is.
+fn pretty(value: &str) -> Text<'static> {
     let trimmed = value.trim_start();
     if (trimmed.starts_with('{') || trimmed.starts_with('['))
         && let Ok(json) = serde_json::from_str::<serde_json::Value>(value)
         && let Ok(text) = serde_json::to_string_pretty(&json)
     {
-        return text;
+        return Text::from(syntax::json(&text));
     }
-    value.replace('\r', "").replace('\t', "    ")
+    Text::raw(value.replace('\r', "").replace('\t', "    "))
 }
 
 fn draw_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
@@ -1349,24 +1783,29 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
     ];
 
     let section = |(title, keys): &(&'static str, &'static [(&'static str, &'static str)])| -> Vec<Line<'static>> {
-        let mut lines = vec![Line::from(Span::styled(format!(" {title}"), bold()))];
+        let mut lines = vec![
+            Line::styled(*title, accent().add_modifier(Modifier::BOLD)),
+        ];
         for (key, what) in *keys {
             lines.push(Line::from(vec![
-                Span::styled(format!("   {} ", fit(key, 14, false)), accent()),
-                Span::raw(*what),
+                Span::styled(format!("  {} ", fit(key, 14, false)), accent()),
+                Span::styled(*what, Style::new()),
             ]));
         }
         lines.push(Line::default());
         lines
     };
-    let note = Line::from(Span::styled(
-        " kikkert only reads. Statements that could change anything are refused.",
-        dim(),
-    ));
+    let note = Line::from(vec![
+        Span::styled("● ", good()),
+        Span::styled(
+            "kikkert only reads. Statements that could change anything are refused.",
+            muted(),
+        ),
+    ]);
 
     // Two columns when the window is wide enough, otherwise one long one.
     const COLUMN: u16 = 72;
-    let wide = area.width >= COLUMN * 2 + 4;
+    let wide = area.width >= COLUMN * 2 + 6;
     let (left, right): (Vec<Line>, Vec<Line>) = if wide {
         (
             HELP[..2].iter().flat_map(section).collect(),
@@ -1380,16 +1819,21 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
     };
 
     let wanted = left.len().max(right.len()) as u16;
-    let width = if wide { COLUMN * 2 + 2 } else { COLUMN + 2 };
-    let at = centered(area, width, wanted + 2);
-    let room = at.height.saturating_sub(2);
+    let width = if wide { COLUMN * 2 + 4 } else { COLUMN + 4 };
+    let at = centered(area, width, wanted + 3);
+    let room = at.height.saturating_sub(3);
     *scroll = (*scroll).min(wanted.saturating_sub(room));
-    let hint = if wanted > room {
-        "↑↓ scroll · any other key closes"
+    let hints: Hints = if wanted > room {
+        &[("↑↓", "scroll"), ("", "any other key closes")]
     } else {
-        "any key closes"
+        &[("", "any key closes")]
     };
-    let inner = popup(frame, at, "Keys", hint);
+    let inner = popup(frame, at, "Keys", hints);
+    let inner = Rect {
+        y: inner.y + 1,
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
     if wide {
         let [left_area, right_area] =
             Layout::horizontal([Constraint::Length(COLUMN), Constraint::Min(1)]).areas(inner);
@@ -1398,4 +1842,17 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
     } else {
         frame.render_widget(Paragraph::new(left).scroll((*scroll, 0)), inner);
     }
+    let track = Rect {
+        x: at.right().saturating_sub(1),
+        width: 1,
+        ..inner
+    };
+    scrollbar(
+        frame,
+        track,
+        *scroll as usize,
+        room as usize,
+        wanted as usize,
+        true,
+    );
 }
