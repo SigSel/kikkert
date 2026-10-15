@@ -323,20 +323,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if !matches!(app.overlay, Overlay::None | Overlay::Editor(_)) {
         scrim(frame, body);
     }
+    let ws = app.workspaces.get(app.current);
     match &mut app.overlay {
         Overlay::Help { scroll } => draw_help(frame, body, scroll),
         Overlay::Filter(dialog) => {
-            if let Some(ws) = &app.ws {
+            if let Some(ws) = ws {
                 draw_filter(frame, body, dialog, ws);
             }
         }
         Overlay::Filters { selected } => {
-            if let Some(ws) = &app.ws {
+            if let Some(ws) = ws {
                 draw_filters(frame, body, *selected, ws);
             }
         }
         Overlay::Record(record) => {
-            if let Some(grid) = app.ws.as_ref().and_then(Workspace::grid) {
+            if let Some(grid) = ws.and_then(Workspace::grid) {
                 draw_record(frame, body, record, grid);
             }
         }
@@ -366,10 +367,32 @@ fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(width),
     ])
     .areas(area);
-    if let (Screen::Workspace, Some(ws)) = (app.screen, &app.ws) {
+    // A tab for each open connection. A busy one out of sight spins.
+    let on_screen = (app.screen == Screen::Workspace).then_some(app.current);
+    for (i, ws) in app.workspaces.iter().enumerate() {
+        let name = &ws.session.spec().name;
+        spans.push(Span::raw(" "));
+        if on_screen == Some(i) {
+            spans.push(Span::styled(
+                format!(" {name} "),
+                Style::new()
+                    .bg(t.surface)
+                    .fg(t.text)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(format!(" {name} "), muted()));
+            if ws.busy().is_some() {
+                spans.push(Span::styled(
+                    format!("{} ", SPINNER[app.tick % SPINNER.len()]),
+                    accent(),
+                ));
+            }
+        }
+    }
+    if let Some(ws) = on_screen.and_then(|i| app.workspaces.get(i)) {
         let spec = ws.session.spec();
         spans.extend([
-            Span::styled(format!("  {}", spec.name), bold()),
             Span::raw("  "),
             Span::styled(spec.engine.label(), Style::new().fg(t.engine(spec.engine))),
             Span::styled(" · ", faint()),
@@ -445,9 +468,17 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn hints(app: &App) -> Hints {
-    match (&app.overlay, app.screen, &app.ws) {
+    match (&app.overlay, app.screen, app.ws()) {
         (Overlay::Editor(_), ..) => &[("F5", "run"), ("Ctrl-L", "reset"), ("Esc", "close")],
-        (Overlay::None, Screen::Picker, _) => &[
+        (Overlay::None, Screen::Picker, Some(_)) => &[
+            ("Enter", "connect"),
+            ("Esc", "back"),
+            ("/", "filter"),
+            ("r", "reload"),
+            ("?", "help"),
+            ("Q", "quit"),
+        ],
+        (Overlay::None, Screen::Picker, None) => &[
             ("Enter", "connect"),
             ("/", "filter"),
             ("r", "reload"),
@@ -463,6 +494,7 @@ fn hints(app: &App) -> Hints {
                 ("/", "filter"),
                 ("Tab", "data"),
                 ("e", "SQL"),
+                ("c", "connect"),
                 ("?", "help"),
             ],
             Focus::Main if ws.tab != 0 => &[
@@ -497,7 +529,7 @@ fn hints(app: &App) -> Hints {
 }
 
 fn position_text(app: &App) -> Vec<String> {
-    let Some(ws) = &app.ws else {
+    let Some(ws) = app.ws() else {
         return Vec::new();
     };
     if app.screen != Screen::Workspace {
@@ -617,8 +649,12 @@ fn draw_picker(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         format!(" {} of {} ", shown.len(), app.cfg.connections.len())
     };
+    let title = match app.ws() {
+        Some(ws) if picker.replace => format!("Replace {}", ws.session.spec().name),
+        _ => "Connections".to_string(),
+    };
     let block = panel(true)
-        .title(panel_title("Connections", true))
+        .title(panel_title(&title, true))
         .title(Line::styled(count, muted()).right_aligned())
         .padding(Padding::uniform(1));
     let inner = block.inner(card_area);
@@ -659,7 +695,14 @@ fn draw_picker(frame: &mut Frame, area: Rect, app: &App) {
             let engine = connection.engine.as_deref().unwrap_or("");
             let engine_style = Engine::parse(engine)
                 .map_or_else(muted, |engine| Style::new().fg(t.engine(engine)));
-            let summary_width = list_width.saturating_sub(name_width + 15);
+            let mut summary_width = list_width.saturating_sub(name_width + 15);
+            let status = if app.workspace_of(&connection.name).is_some() {
+                const CONNECTED: &str = "● connected  ";
+                summary_width = summary_width.saturating_sub(text_width(CONNECTED));
+                Span::styled(CONNECTED, good())
+            } else {
+                Span::raw("")
+            };
             let is_selected = row == picker.selected;
             let (bar, name_style, summary_style, line_style) = if is_selected {
                 (
@@ -678,6 +721,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, app: &App) {
                     name_style,
                 ),
                 Span::styled(format!("{}  ", fit(engine, 9, false)), engine_style),
+                status,
                 Span::styled(
                     fit(&connection.summary(), summary_width, false),
                     summary_style,
@@ -785,7 +829,9 @@ fn draw_welcome(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_workspace(frame: &mut Frame, area: Rect, app: &mut App) {
     let tick = app.tick;
-    let Some(ws) = &mut app.ws else { return };
+    let Some(ws) = app.workspaces.get_mut(app.current) else {
+        return;
+    };
     let side_width = (area.width / 4)
         .clamp(20, 40)
         .min(area.width.saturating_sub(24));
@@ -1731,8 +1777,16 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
                 ("e", "edit and run SQL"),
                 ("1 … 5", "Data, Columns, Indexes, Keys, Definition"),
                 ("Esc", "cancel a running query, close a dialog"),
-                ("C", "back to the connection list"),
-                ("q", "quit"),
+            ],
+        ),
+        (
+            "Connections",
+            &[
+                ("c", "open another; Esc comes back"),
+                ("C", "open another in place of this one"),
+                ("r  R", "next and previous open connection"),
+                ("q", "close this connection"),
+                ("Q", "quit"),
             ],
         ),
         (
@@ -1745,7 +1799,7 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
                 ("]  [", "next and previous page"),
                 ("Enter", "show the whole row"),
                 ("y  Y", "copy the cell, copy the row"),
-                ("r", "run again"),
+                ("F5  Ctrl-R", "run again"),
             ],
         ),
         (
@@ -1808,8 +1862,8 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
     let wide = area.width >= COLUMN * 2 + 6;
     let (left, right): (Vec<Line>, Vec<Line>) = if wide {
         (
-            HELP[..2].iter().flat_map(section).collect(),
-            HELP[2..].iter().flat_map(section).chain([note]).collect(),
+            HELP[..3].iter().flat_map(section).collect(),
+            HELP[3..].iter().flat_map(section).chain([note]).collect(),
         )
     } else {
         (

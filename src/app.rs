@@ -25,12 +25,13 @@ use crate::ui;
 pub enum Msg {
     Term(Event),
     Progress(u64, String),
+    Connected(u64, Result<Connected, String>),
     Done(u64, Output),
 }
 
-/// What a background job hands back. Errors are already text for display.
+/// What a workspace's background job hands back. Errors are already text
+/// for display.
 pub enum Output {
-    Connected(Result<Connected, String>),
     Opened(Result<Box<Opened>, String>),
     Page(Result<ResultSet, String>),
     Count(Result<u64, String>),
@@ -51,6 +52,8 @@ pub struct Opened {
     page: Result<ResultSet, String>,
 }
 
+/// A running background job. Dropping it cancels the work, which closes its
+/// connection mid-statement.
 pub struct Job {
     id: u64,
     handle: AbortHandle,
@@ -58,14 +61,38 @@ pub struct Job {
     pub started: Instant,
 }
 
+impl Drop for Job {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Slot {
-    /// Connecting, opening a table, loading a page. One at a time.
+    /// Opening a table, loading a page. One at a time.
     Main,
     /// The row count in the status bar.
     Count,
     /// Structure tabs.
     Aux,
+}
+
+/// A workspace's jobs, one per [`Slot`].
+#[derive(Default)]
+struct Jobs {
+    main: Option<Job>,
+    count: Option<Job>,
+    aux: Option<Job>,
+}
+
+impl Jobs {
+    fn slot(&mut self, slot: Slot) -> &mut Option<Job> {
+        match slot {
+            Slot::Main => &mut self.main,
+            Slot::Count => &mut self.count,
+            Slot::Aux => &mut self.aux,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,6 +119,8 @@ pub struct Picker {
     pub filtering: bool,
     pub selected: usize,
     pub error: Option<String>,
+    /// The connection picked takes the place of the one on screen.
+    pub replace: bool,
 }
 
 /// A result laid out as a grid, with a cell cursor.
@@ -241,9 +270,15 @@ pub struct Workspace {
     /// Earlier states of the query, for Backspace.
     pub back: Vec<TableQuery>,
     draft: Option<String>,
+    jobs: Jobs,
 }
 
 impl Workspace {
+    /// The job the user is waiting on, if any.
+    pub fn busy(&self) -> Option<&Job> {
+        self.jobs.main.as_ref().or(self.jobs.aux.as_ref())
+    }
+
     /// Indexes into `objects` that match the sidebar filter.
     pub fn visible(&self) -> Vec<usize> {
         let needle = self.side.filter.text().to_lowercase();
@@ -370,20 +405,26 @@ pub struct App {
     pub cfg_path: PathBuf,
     pub screen: Screen,
     pub picker: Picker,
-    pub ws: Option<Workspace>,
+    /// One per open connection, in the order they were opened.
+    pub workspaces: Vec<Workspace>,
+    /// The workspace on screen, or the one Esc on the picker goes back to.
+    pub current: usize,
     pub overlay: Overlay,
     pub toast: Option<Toast>,
     pub quit: bool,
     pub tick: usize,
-    main_job: Option<Job>,
-    count_job: Option<Job>,
-    aux_job: Option<Job>,
+    connecting: Option<Job>,
     tx: UnboundedSender<Msg>,
     next_id: u64,
 }
 
 fn is_ctrl(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// F5 or Ctrl-R: run the SQL in the editor, or run the data view again.
+fn is_run(key: &KeyEvent) -> bool {
+    key.code == KeyCode::F(5) || (is_ctrl(key) && key.code == KeyCode::Char('r'))
 }
 
 impl App {
@@ -401,22 +442,39 @@ impl App {
                 error: cfg_error,
                 ..Picker::default()
             },
-            ws: None,
+            workspaces: Vec::new(),
+            current: 0,
             overlay: Overlay::None,
             toast: None,
             quit: false,
             tick: 0,
-            main_job: None,
-            count_job: None,
-            aux_job: None,
+            connecting: None,
             tx,
             next_id: 0,
         }
     }
 
+    pub fn ws(&self) -> Option<&Workspace> {
+        self.workspaces.get(self.current)
+    }
+
+    fn ws_mut(&mut self) -> Option<&mut Workspace> {
+        self.workspaces.get_mut(self.current)
+    }
+
+    /// The workspace of the open connection called `name`, if any.
+    pub fn workspace_of(&self, name: &str) -> Option<usize> {
+        self.workspaces
+            .iter()
+            .position(|ws| ws.session.spec().name.eq_ignore_ascii_case(name))
+    }
+
     /// The job the user is waiting on, if any.
     pub fn busy(&self) -> Option<&Job> {
-        self.main_job.as_ref().or(self.aux_job.as_ref())
+        match self.screen {
+            Screen::Picker => self.connecting.as_ref(),
+            Screen::Workspace => self.ws().and_then(Workspace::busy),
+        }
     }
 
     pub fn on_tick(&mut self) {
@@ -448,45 +506,42 @@ impl App {
 
     // ---- background jobs --------------------------------------------------
 
-    fn spawn<F, Fut>(&mut self, slot: Slot, label: impl Into<String>, make: F)
+    /// Runs the future `make` builds in the background, and sends the message
+    /// it ends with.
+    fn start<F, Fut>(&mut self, label: impl Into<String>, make: F) -> Job
     where
         F: FnOnce(u64, UnboundedSender<Msg>) -> Fut,
-        Fut: Future<Output = Output> + Send + 'static,
+        Fut: Future<Output = Msg> + Send + 'static,
     {
         self.next_id += 1;
         let id = self.next_id;
         let work = make(id, self.tx.clone());
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
-            let output = work.await;
-            let _ = tx.send(Msg::Done(id, output));
+            let _ = tx.send(work.await);
         })
         .abort_handle();
-        let job = Job {
+        Job {
             id,
             handle,
             label: label.into(),
             started: Instant::now(),
-        };
-        let slot = match slot {
-            Slot::Main => &mut self.main_job,
-            Slot::Count => &mut self.count_job,
-            Slot::Aux => &mut self.aux_job,
-        };
-        // Dropping the old job's future closes its connection mid-statement.
-        if let Some(old) = slot.replace(job) {
-            old.handle.abort();
+        }
+    }
+
+    /// Starts a job for workspace `ws`, cancelling the one in its slot.
+    fn spawn<Fut>(&mut self, ws: usize, slot: Slot, label: impl Into<String>, work: Fut)
+    where
+        Fut: Future<Output = Output> + Send + 'static,
+    {
+        let job = self.start(label, |id, _| async move { Msg::Done(id, work.await) });
+        if let Some(ws) = self.workspaces.get_mut(ws) {
+            *ws.jobs.slot(slot) = Some(job);
         }
     }
 
     fn abort(slot: &mut Option<Job>) -> bool {
-        match slot.take() {
-            Some(job) => {
-                job.handle.abort();
-                true
-            }
-            None => false,
-        }
+        slot.take().is_some()
     }
 
     fn take_job(slot: &mut Option<Job>, id: u64) -> bool {
@@ -504,72 +559,112 @@ impl App {
             Msg::Term(Event::Paste(text)) => self.on_paste(&text),
             Msg::Term(_) => {}
             Msg::Progress(id, label) => {
-                if let Some(job) = self.main_job.as_mut().filter(|job| job.id == id) {
+                if let Some(job) = self.connecting.as_mut().filter(|job| job.id == id) {
                     job.label = label;
+                }
+            }
+            // A result from a job that was replaced or cancelled is ignored.
+            Msg::Connected(id, result) => {
+                if Self::take_job(&mut self.connecting, id) {
+                    self.on_connected(result);
                 }
             }
             Msg::Done(id, output) => self.on_done(id, output),
         }
     }
 
-    fn on_done(&mut self, id: u64, output: Output) {
-        // A result from a job that was replaced or cancelled is ignored.
-        let current = match &output {
-            Output::Connected(_) | Output::Opened(_) | Output::Page(_) => {
-                Self::take_job(&mut self.main_job, id)
+    fn on_connected(&mut self, result: Result<Connected, String>) {
+        let connected = match result {
+            Ok(connected) => connected,
+            Err(error) => {
+                self.picker.error = Some(error);
+                return;
             }
-            Output::Count(_) => Self::take_job(&mut self.count_job, id),
-            Output::Structure(..) => Self::take_job(&mut self.aux_job, id),
         };
-        if !current {
-            return;
+        self.picker.error = None;
+        let ws = Workspace {
+            session: connected.session,
+            objects: connected.objects,
+            side: Sidebar::default(),
+            focus: Focus::Sidebar,
+            table: None,
+            custom: None,
+            tab: 0,
+            data: Pane::Empty,
+            sql: String::new(),
+            total: Total::Unavailable,
+            back: Vec::new(),
+            draft: None,
+            jobs: Jobs::default(),
+        };
+        // A replacement goes next to the one it replaces, which then closes.
+        let at = if self.picker.replace {
+            (self.current + 1).min(self.workspaces.len())
+        } else {
+            self.workspaces.len()
+        };
+        self.workspaces.insert(at, ws);
+        self.arrive(at);
+    }
+
+    /// Shows workspace `i` once a connection has been picked, closing the
+    /// one it replaces.
+    fn arrive(&mut self, i: usize) {
+        let previous = self.current;
+        self.current = i;
+        self.screen = Screen::Workspace;
+        if std::mem::take(&mut self.picker.replace)
+            && previous != i
+            && previous < self.workspaces.len()
+        {
+            let closed = self.workspaces.remove(previous);
+            if previous < i {
+                self.current -= 1;
+            }
+            self.say(format!("Closed {}", closed.session.spec().name));
         }
+    }
+
+    fn on_done(&mut self, id: u64, output: Output) {
+        let slot = match &output {
+            Output::Opened(_) | Output::Page(_) => Slot::Main,
+            Output::Count(_) => Slot::Count,
+            Output::Structure(..) => Slot::Aux,
+        };
+        // The result goes to the workspace that started the job, which need
+        // not be the one on screen. One that was replaced or cancelled, or
+        // whose connection was closed, is ignored.
+        let Some(i) = self
+            .workspaces
+            .iter_mut()
+            .position(|ws| Self::take_job(ws.jobs.slot(slot), id))
+        else {
+            return;
+        };
         match output {
-            Output::Connected(Ok(connected)) => {
-                self.picker.error = None;
-                self.ws = Some(Workspace {
-                    session: connected.session,
-                    objects: connected.objects,
-                    side: Sidebar::default(),
-                    focus: Focus::Sidebar,
-                    table: None,
-                    custom: None,
-                    tab: 0,
-                    data: Pane::Empty,
-                    sql: String::new(),
-                    total: Total::Unavailable,
-                    back: Vec::new(),
-                    draft: None,
-                });
-                self.screen = Screen::Workspace;
-            }
-            Output::Connected(Err(error)) => self.picker.error = Some(error),
-            Output::Opened(Ok(opened)) => self.on_opened(*opened),
+            Output::Opened(Ok(opened)) => self.on_opened(i, *opened),
             Output::Opened(Err(error)) => {
-                Self::abort(&mut self.count_job);
-                Self::abort(&mut self.aux_job);
-                if let Some(ws) = &mut self.ws {
-                    ws.table = None;
-                    ws.custom = None;
-                    ws.tab = 0;
-                    ws.sql.clear();
-                    ws.back.clear();
-                    ws.total = Total::Unavailable;
-                    ws.data = Pane::Error(error);
-                }
+                let ws = &mut self.workspaces[i];
+                Self::abort(&mut ws.jobs.count);
+                Self::abort(&mut ws.jobs.aux);
+                ws.table = None;
+                ws.custom = None;
+                ws.tab = 0;
+                ws.sql.clear();
+                ws.back.clear();
+                ws.total = Total::Unavailable;
+                ws.data = Pane::Error(error);
             }
-            Output::Page(result) => self.on_page(result),
+            Output::Page(result) => self.on_page(i, result),
             Output::Count(result) => {
-                if let Some(ws) = &mut self.ws {
-                    ws.total = match result {
-                        Ok(count) => Total::Known(count),
-                        Err(_) => Total::Unavailable,
-                    };
-                }
+                self.workspaces[i].total = match result {
+                    Ok(count) => Total::Known(count),
+                    Err(_) => Total::Unavailable,
+                };
             }
             Output::Structure(index, result) => {
                 let width = self.cfg.settings.max_column_width as usize;
-                if let Some(table) = self.ws.as_mut().and_then(|ws| ws.table.as_mut())
+                if let Some(table) = self.workspaces[i].table.as_mut()
                     && let Some(pane) = table.panes.get_mut(index)
                 {
                     *pane = match result {
@@ -605,10 +700,16 @@ impl App {
         let Some(connection) = self.cfg.connections.get(index).cloned() else {
             return;
         };
+        // One that is open already is switched to, not opened twice.
+        if let Some(open) = self.workspace_of(&connection.name) {
+            Self::abort(&mut self.connecting);
+            self.arrive(open);
+            return;
+        }
         let cfg = self.cfg.clone();
         self.picker.error = None;
         let label = format!("Connecting to {}", connection.name);
-        self.spawn(Slot::Main, label, move |id, tx| async move {
+        let job = self.start(label, move |id, tx| async move {
             let result: anyhow::Result<Connected> = async {
                 let uses_op = connection.item.is_some()
                     || [
@@ -641,17 +742,50 @@ impl App {
                 })
             }
             .await;
-            Output::Connected(result.map_err(|e| format!("{e:#}")))
+            Msg::Connected(id, result.map_err(|e| format!("{e:#}")))
         });
+        self.connecting = Some(job);
     }
 
-    fn disconnect(&mut self) {
-        Self::abort(&mut self.main_job);
-        Self::abort(&mut self.count_job);
-        Self::abort(&mut self.aux_job);
-        self.ws = None;
-        self.overlay = Overlay::None;
+    /// Shows the connection list. What is open stays open, unless `replace`
+    /// says the connection picked takes the place of the one on screen.
+    fn show_picker(&mut self, replace: bool) {
+        self.picker.filtering = false;
+        self.picker.filter.clear();
+        self.picker.error = None;
+        self.picker.replace = replace && self.ws().is_some();
         self.screen = Screen::Picker;
+    }
+
+    /// Goes back from the connection list to the open connections, giving up
+    /// on any connection still being made.
+    fn leave_picker(&mut self) {
+        Self::abort(&mut self.connecting);
+        self.picker.replace = false;
+        self.screen = Screen::Workspace;
+    }
+
+    /// Closes the connection on screen, and stops whatever it was running.
+    fn close(&mut self) {
+        if self.current >= self.workspaces.len() {
+            return;
+        }
+        let closed = self.workspaces.remove(self.current);
+        self.current = self.current.min(self.workspaces.len().saturating_sub(1));
+        if self.workspaces.is_empty() {
+            self.show_picker(false);
+        }
+        self.say(format!("Closed {}", closed.session.spec().name));
+    }
+
+    /// Moves to the next or previous open connection.
+    fn cycle(&mut self, forward: bool) {
+        let count = self.workspaces.len();
+        if count < 2 {
+            self.say("This is the only open connection: c opens another");
+            return;
+        }
+        self.current = (self.current + if forward { 1 } else { count - 1 }) % count;
     }
 
     fn reload_config(&mut self) {
@@ -670,7 +804,7 @@ impl App {
     // ---- tables and queries -----------------------------------------------
 
     fn open_selected(&mut self) {
-        let Some(ws) = &mut self.ws else { return };
+        let Some(ws) = self.ws_mut() else { return };
         let visible = ws.visible();
         let Some(&index) = visible.get(ws.side.selected) else {
             return;
@@ -680,7 +814,7 @@ impl App {
         let session = ws.session.clone();
         let cfg = self.cfg.clone();
         let label = format!("Opening {}", object.display_name());
-        self.spawn(Slot::Main, label, move |_, _| async move {
+        self.spawn(self.current, Slot::Main, label, async move {
             let engine = session.engine();
             let result: anyhow::Result<Opened> = async {
                 let tabs = meta::structure_tabs(engine, &object);
@@ -714,11 +848,13 @@ impl App {
         });
     }
 
-    fn on_opened(&mut self, opened: Opened) {
-        Self::abort(&mut self.count_job);
-        Self::abort(&mut self.aux_job);
+    fn on_opened(&mut self, i: usize, opened: Opened) {
         let width = self.cfg.settings.max_column_width as usize;
-        let Some(ws) = &mut self.ws else { return };
+        let Some(ws) = self.workspaces.get_mut(i) else {
+            return;
+        };
+        Self::abort(&mut ws.jobs.count);
+        Self::abort(&mut ws.jobs.aux);
         let mut panes: Vec<Pane> = opened.tabs.iter().map(|_| Pane::Empty).collect();
         panes[0] = Pane::Grid(Grid::new(opened.columns, width));
         ws.table = Some(TableCtx {
@@ -735,12 +871,14 @@ impl App {
         ws.total = Total::Unknown;
         ws.focus = Focus::Main;
         ws.data = Pane::Empty;
-        self.on_page(opened.page);
+        self.on_page(i, opened.page);
     }
 
-    fn on_page(&mut self, result: Result<ResultSet, String>) {
+    fn on_page(&mut self, i: usize, result: Result<ResultSet, String>) {
         let width = self.cfg.settings.max_column_width as usize;
-        let Some(ws) = &mut self.ws else { return };
+        let Some(ws) = self.workspaces.get_mut(i) else {
+            return;
+        };
         match result {
             Ok(result) => {
                 let mut grid = Grid::new(result, width);
@@ -763,7 +901,7 @@ impl App {
                         // The first page is not full, so it is everything.
                         ws.total = Total::Known(rows as u64);
                     } else {
-                        self.start_count();
+                        self.start_count(i);
                     }
                 }
             }
@@ -771,14 +909,15 @@ impl App {
         }
     }
 
-    fn start_count(&mut self) {
-        let Some(limits) = self.cfg.settings.count_limits() else {
-            if let Some(ws) = &mut self.ws {
-                ws.total = Total::Unavailable;
-            }
+    fn start_count(&mut self, i: usize) {
+        let limits = self.cfg.settings.count_limits();
+        let Some(ws) = self.workspaces.get_mut(i) else {
             return;
         };
-        let Some(ws) = &mut self.ws else { return };
+        let Some(limits) = limits else {
+            ws.total = Total::Unavailable;
+            return;
+        };
         let Some(sql) = ws
             .table
             .as_ref()
@@ -788,7 +927,7 @@ impl App {
         };
         ws.total = Total::Counting;
         let session = ws.session.clone();
-        self.spawn(Slot::Count, "Counting rows", move |_, _| async move {
+        self.spawn(i, Slot::Count, "Counting rows", async move {
             let result = session.query(&sql, limits).await;
             Output::Count(match result {
                 Ok(result) => result
@@ -805,14 +944,14 @@ impl App {
     /// Runs the open table's query as it now stands.
     fn run_table(&mut self) {
         let limits = self.cfg.settings.page_limits();
-        let Some(ws) = &mut self.ws else { return };
+        let Some(ws) = self.ws_mut() else { return };
         let Some(table) = &ws.table else { return };
         let sql = table.query.sql(ws.session.engine());
         ws.custom = None;
         ws.tab = 0;
         ws.sql = sql.clone();
         let session = ws.session.clone();
-        self.spawn(Slot::Main, "Running query", move |_, _| async move {
+        self.spawn(self.current, Slot::Main, "Running query", async move {
             Output::Page(
                 session
                     .query(&sql, limits)
@@ -828,14 +967,14 @@ impl App {
             return;
         }
         let limits = self.cfg.settings.custom_limits();
-        let Some(ws) = &mut self.ws else { return };
-        Self::abort(&mut self.count_job);
+        let Some(ws) = self.ws_mut() else { return };
+        Self::abort(&mut ws.jobs.count);
         ws.custom = Some(sql.clone());
         ws.tab = 0;
         ws.sql = sql.clone();
         ws.total = Total::Unavailable;
         let session = ws.session.clone();
-        self.spawn(Slot::Main, "Running SQL", move |_, _| async move {
+        self.spawn(self.current, Slot::Main, "Running SQL", async move {
             Output::Page(
                 session
                     .query(&sql, limits)
@@ -848,12 +987,12 @@ impl App {
     /// Changes the open table's query and reruns it. `refilter` says the set
     /// of matching rows changed, so the row count is stale.
     fn change_query(&mut self, refilter: bool, change: impl FnOnce(&mut TableQuery)) {
-        let Some(ws) = &mut self.ws else { return };
+        let Some(ws) = self.ws_mut() else { return };
         let Some(table) = &mut ws.table else { return };
         if refilter {
             table.query.page = 0;
             ws.total = Total::Unknown;
-            Self::abort(&mut self.count_job);
+            Self::abort(&mut ws.jobs.count);
         }
         change(&mut table.query);
         self.run_table();
@@ -867,7 +1006,7 @@ impl App {
 
     fn switch_tab(&mut self, index: usize) {
         let limits = self.cfg.settings.custom_limits();
-        let Some(ws) = &mut self.ws else { return };
+        let Some(ws) = self.ws_mut() else { return };
         if index >= ws.tab_titles().len() {
             return;
         }
@@ -886,9 +1025,10 @@ impl App {
         let title = table.tabs[index - 1].title;
         let session = ws.session.clone();
         self.spawn(
+            self.current,
             Slot::Aux,
             format!("Loading {}", title.to_lowercase()),
-            move |_, _| async move {
+            async move {
                 let result = session.catalog_query(&sql, limits).await;
                 Output::Structure(index - 1, result.map_err(|e| format!("{e:#}")))
             },
@@ -896,7 +1036,7 @@ impl App {
     }
 
     fn reload(&mut self) {
-        let Some(ws) = &mut self.ws else { return };
+        let Some(ws) = self.ws_mut() else { return };
         if ws.tab > 0 {
             let tab = ws.tab;
             if let Some(table) = &mut ws.table {
@@ -912,7 +1052,7 @@ impl App {
     }
 
     fn turn_page(&mut self, forward: bool) {
-        let Some(ws) = &self.ws else { return };
+        let Some(ws) = self.ws() else { return };
         if ws.custom.is_some() {
             self.say("Hand-written SQL is not paged; everything it returned is here");
             return;
@@ -940,7 +1080,7 @@ impl App {
     }
 
     fn go_back(&mut self) {
-        let Some(ws) = &mut self.ws else { return };
+        let Some(ws) = self.ws_mut() else { return };
         if ws.custom.is_some() {
             if ws.table.is_some() {
                 ws.total = Total::Unknown;
@@ -957,7 +1097,7 @@ impl App {
     }
 
     fn remember(&mut self) {
-        if let Some(ws) = &mut self.ws
+        if let Some(ws) = self.ws_mut()
             && let Some(table) = &ws.table
         {
             ws.back.push(table.query.clone());
@@ -966,7 +1106,7 @@ impl App {
 
     /// Shows how often each value (or combination of marked columns) occurs.
     fn group_by(&mut self, duplicates_only: bool) {
-        let Some(ws) = &self.ws else { return };
+        let Some(ws) = self.ws() else { return };
         let (Some(table), Some(grid)) = (&ws.table, ws.grid()) else {
             return;
         };
@@ -1002,7 +1142,7 @@ impl App {
 
     /// From a duplicates row, shows the rows that share those values.
     fn drill_down(&mut self) {
-        let Some(ws) = &self.ws else { return };
+        let Some(ws) = self.ws() else { return };
         let (Some(columns), Some(grid)) = (ws.groups(), ws.grid()) else {
             return;
         };
@@ -1033,7 +1173,7 @@ impl App {
     }
 
     fn quick_filter(&mut self, op: Op) {
-        let Some(ws) = &self.ws else { return };
+        let Some(ws) = self.ws() else { return };
         let Some(grid) = ws.grid() else { return };
         let (Some(column), Some(value)) = (grid.column(), grid.value()) else {
             return;
@@ -1059,7 +1199,7 @@ impl App {
     }
 
     fn yank(&mut self, whole_row: bool) {
-        let Some(grid) = self.ws.as_ref().and_then(Workspace::grid) else {
+        let Some(grid) = self.ws().and_then(Workspace::grid) else {
             return;
         };
         let Some(row) = grid.result.rows.get(grid.row) else {
@@ -1081,7 +1221,7 @@ impl App {
     }
 
     fn open_editor(&mut self) {
-        let Some(ws) = &mut self.ws else { return };
+        let Some(ws) = self.ws_mut() else { return };
         let text = ws
             .draft
             .clone()
@@ -1092,7 +1232,7 @@ impl App {
     }
 
     fn open_filter(&mut self) {
-        let Some(ws) = &self.ws else { return };
+        let Some(ws) = self.ws() else { return };
         // Start on the column under the cursor, ready for a value.
         let column = ws.grid().and_then(Grid::column).map(|c| c.name.clone());
         let known = ws.table.as_ref().is_some_and(|t| {
@@ -1127,16 +1267,18 @@ impl App {
                 FilterField::Value => dialog.value.insert_str(text),
                 FilterField::Operator => {}
             },
-            Overlay::None => {
-                if self.screen == Screen::Picker && self.picker.filtering {
-                    self.picker.filter.insert_str(text);
-                } else if let Some(ws) = &mut self.ws
-                    && ws.side.filtering
-                {
-                    ws.side.filter.insert_str(text);
-                    ws.side.selected = 0;
+            Overlay::None => match self.screen {
+                Screen::Picker if self.picker.filtering => self.picker.filter.insert_str(text),
+                Screen::Picker => {}
+                Screen::Workspace => {
+                    if let Some(ws) = self.workspaces.get_mut(self.current)
+                        && ws.side.filtering
+                    {
+                        ws.side.filter.insert_str(text);
+                        ws.side.selected = 0;
+                    }
                 }
-            }
+            },
             _ => {}
         }
     }
@@ -1170,7 +1312,14 @@ impl App {
     }
 
     fn cancel_job(&mut self) -> bool {
-        if Self::abort(&mut self.main_job) {
+        let job = match self.screen {
+            Screen::Picker => &mut self.connecting,
+            Screen::Workspace => match self.workspaces.get_mut(self.current) {
+                Some(ws) => &mut ws.jobs.main,
+                None => return false,
+            },
+        };
+        if Self::abort(job) {
             self.say("Cancelled");
             true
         } else {
@@ -1206,11 +1355,17 @@ impl App {
         }
         match key.code {
             KeyCode::Esc if self.cancel_job() => {}
+            KeyCode::Esc if self.picker.filter.is_empty() && !self.workspaces.is_empty() => {
+                self.leave_picker()
+            }
             KeyCode::Esc => {
                 self.picker.filter.clear();
                 self.picker.selected = 0;
             }
-            KeyCode::Char('q') => self.quit = true,
+            // q closes what is on screen: this list, back to the open
+            // connections, or kikkert itself when none are open.
+            KeyCode::Char('q') if !self.workspaces.is_empty() => self.leave_picker(),
+            KeyCode::Char('q' | 'Q') => self.quit = true,
             KeyCode::Char('?') => self.overlay = Overlay::Help { scroll: 0 },
             KeyCode::Char('/') => self.picker.filtering = true,
             KeyCode::Char('r') => self.reload_config(),
@@ -1245,13 +1400,12 @@ impl App {
 
     fn workspace_key(&mut self, key: KeyEvent) {
         let typing = self
-            .ws
-            .as_ref()
+            .ws()
             .is_some_and(|ws| ws.focus == Focus::Sidebar && ws.side.filtering);
         if key.code == KeyCode::Esc && !typing && self.cancel_job() {
             return;
         }
-        let Some(ws) = &mut self.ws else { return };
+        let Some(ws) = self.ws_mut() else { return };
 
         if ws.focus == Focus::Sidebar && ws.side.filtering {
             let last = ws.visible().len().saturating_sub(1);
@@ -1275,9 +1429,13 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => self.close(),
+            KeyCode::Char('Q') => self.quit = true,
             KeyCode::Char('?') => self.overlay = Overlay::Help { scroll: 0 },
-            KeyCode::Char('C') => self.disconnect(),
+            KeyCode::Char('c') => self.show_picker(false),
+            KeyCode::Char('C') => self.show_picker(true),
+            KeyCode::Char('r') if !is_ctrl(&key) => self.cycle(true),
+            KeyCode::Char('R') => self.cycle(false),
             KeyCode::Char('e') => self.open_editor(),
             KeyCode::Char('t') => {
                 ws.focus = Focus::Sidebar;
@@ -1300,7 +1458,7 @@ impl App {
     }
 
     fn sidebar_key(&mut self, key: KeyEvent) {
-        let Some(ws) = &mut self.ws else { return };
+        let Some(ws) = self.ws_mut() else { return };
         let last = ws.visible().len().saturating_sub(1);
         let side = &mut ws.side;
         match key.code {
@@ -1321,14 +1479,7 @@ impl App {
     }
 
     fn main_key(&mut self, key: KeyEvent) {
-        let Some(ws) = &mut self.ws else { return };
-
-        // Moving left off the first column lands in the table list.
-        let at_left_edge = ws.grid().is_none_or(|g| g.col == 0);
-        if at_left_edge && matches!(key.code, KeyCode::Left | KeyCode::Char('h')) {
-            ws.focus = Focus::Sidebar;
-            return;
-        }
+        let Some(ws) = self.ws_mut() else { return };
         if let Some(grid) = ws.grid_mut()
             && grid.navigate(key)
         {
@@ -1350,7 +1501,7 @@ impl App {
             }
             KeyCode::Char('y') => self.yank(false),
             KeyCode::Char('Y') => self.yank(true),
-            KeyCode::Char('r') => self.reload(),
+            _ if is_run(&key) => self.reload(),
             KeyCode::Backspace if ws.tab == 0 => self.go_back(),
             KeyCode::Char(']') | KeyCode::Char('n') if ws.tab == 0 => self.turn_page(true),
             KeyCode::Char('[') | KeyCode::Char('p') if ws.tab == 0 => self.turn_page(false),
@@ -1364,7 +1515,7 @@ impl App {
     /// Keys that reshape the query. They only make sense while the query
     /// builder owns the Data tab.
     fn builder_key(&mut self, key: KeyEvent) {
-        let Some(ws) = &mut self.ws else { return };
+        let Some(ws) = self.ws_mut() else { return };
         if ws.tab != 0 {
             self.say("Press 1 to go to the data first");
             return;
@@ -1413,8 +1564,7 @@ impl App {
 
     fn filter_key(&mut self, mut dialog: FilterDialog, key: KeyEvent) {
         let columns: Vec<ColumnInfo> = self
-            .ws
-            .as_ref()
+            .ws()
             .and_then(|ws| ws.table.as_ref())
             .map(|t| t.query.columns.clone())
             .unwrap_or_default();
@@ -1496,8 +1646,7 @@ impl App {
 
     fn filters_key(&mut self, mut selected: usize, key: KeyEvent) {
         let count = self
-            .ws
-            .as_ref()
+            .ws()
             .and_then(|ws| ws.table.as_ref())
             .map_or(0, |t| t.query.filters.len());
         match key.code {
@@ -1529,7 +1678,7 @@ impl App {
     }
 
     fn record_key(&mut self, mut record: Record, key: KeyEvent) {
-        let Some(grid) = self.ws.as_ref().and_then(Workspace::grid) else {
+        let Some(grid) = self.ws().and_then(Workspace::grid) else {
             return;
         };
         let last = grid.cols().saturating_sub(1);
@@ -1554,8 +1703,7 @@ impl App {
             KeyCode::Char('=') => {
                 self.sync_cursor(record.field, 0);
                 if self
-                    .ws
-                    .as_ref()
+                    .ws()
                     .is_some_and(|ws| ws.builder_active() && ws.groups().is_none())
                 {
                     self.quick_filter(Op::Equals);
@@ -1576,19 +1724,18 @@ impl App {
 
     /// Keeps the grid cursor on what the row view is showing.
     fn sync_cursor(&mut self, field: usize, row_step: isize) {
-        if let Some(grid) = self.ws.as_mut().and_then(Workspace::grid_mut) {
+        if let Some(grid) = self.ws_mut().and_then(Workspace::grid_mut) {
             grid.col = field.min(grid.cols().saturating_sub(1));
             grid.step_rows(row_step);
         }
     }
 
     fn editor_key(&mut self, mut editor: Editor, key: KeyEvent) {
-        let run = key.code == KeyCode::F(5)
-            || (is_ctrl(&key) && key.code == KeyCode::Char('r'))
+        let run = is_run(&key)
             || (key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Enter);
         if run {
             let sql = editor.text();
-            if let Some(ws) = &mut self.ws {
+            if let Some(ws) = self.ws_mut() {
                 ws.draft = Some(sql.clone());
             }
             self.run_custom(sql);
@@ -1598,7 +1745,7 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 if !self.cancel_job()
-                    && let Some(ws) = &mut self.ws
+                    && let Some(ws) = self.ws_mut()
                 {
                     ws.draft = Some(editor.text());
                     ws.focus = Focus::Main;
@@ -1607,7 +1754,7 @@ impl App {
             }
             KeyCode::Char('l') if is_ctrl(&key) => {
                 // Back to what the query builder would run.
-                if let Some(ws) = &self.ws
+                if let Some(ws) = self.ws()
                     && let Some(table) = &ws.table
                 {
                     editor = Editor::new(&table.query.sql(ws.session.engine()));

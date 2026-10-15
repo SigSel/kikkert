@@ -144,8 +144,16 @@ Press `?` at any time for the full list of keys.
 | `e` | edit the SQL; `F5` or `Ctrl-R` runs it |
 | `y` `Y` | copy the cell or the row |
 | `Esc` | cancel a running query |
-| `C` | back to the connection list |
-| `q` | quit |
+| `c` | open another connection alongside this one; `Esc` comes back |
+| `C` | open another connection in place of this one, which closes once the new one is connected |
+| `r` `R` | next and previous open connection |
+| `F5` or `Ctrl-R` | run again |
+| `q` | close this connection; the last one goes back to the connection list |
+| `Q` | quit |
+
+Each open connection gets a tab in the title bar. Queries keep running in a
+connection you have switched away from, and its tab shows a spinner until
+they finish.
 
 Filtering "contains" works on any column, not only text: numbers, dates and
 ids are compared as text, so `2024-03` finds March and `42` finds order 1042.
