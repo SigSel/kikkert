@@ -16,11 +16,17 @@ distance, and never touches it.
 
 ## Install
 
+Cargo can build kikkert straight from GitHub, without a clone:
+
 ```sh
-cargo install --path .
+cargo install --locked --git https://github.com/SigSel/kikkert
 ```
 
-This needs a Rust toolchain and a C compiler (SQLite is built in). 1Password
+Running the same command again updates to the latest commit on `main`; add
+`--rev <commit>` to install a particular one. From a clone of the repository,
+`cargo install --locked --path .` does the same.
+
+This needs Rust 1.94 or later and a C compiler (SQLite is built in). 1Password
 connections also need the [1Password CLI](https://developer.1password.com/docs/cli/get-started/)
 (`op`) with **Settings → Developer → Integrate with 1Password CLI** switched on
 in the desktop app, so that unlocking happens in the app and not in the terminal.
