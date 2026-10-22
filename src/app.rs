@@ -14,6 +14,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
 
 use crate::clipboard;
+use crate::compare::{Comparison, Snapshot};
 use crate::config::{self, Config};
 use crate::db::meta::{self, DbObject, StructureTab};
 use crate::db::{ResultColumn, ResultSet, Session};
@@ -36,6 +37,14 @@ pub enum Output {
     Page(Result<ResultSet, String>),
     Count(Result<u64, String>),
     Structure(usize, Result<ResultSet, String>),
+    /// A table's columns, read to hold or to compare with the ones held.
+    Columns(Purpose, Result<Box<Snapshot>, String>),
+}
+
+#[derive(Clone, Copy)]
+pub enum Purpose {
+    Hold,
+    Compare,
 }
 
 pub struct Connected {
@@ -391,6 +400,27 @@ pub struct Record {
     pub scroll: u16,
 }
 
+/// Two tables' columns side by side, and where the cursor is.
+pub struct CompareView {
+    pub comparison: Comparison,
+    /// Hide the columns that are the same, or alike, on both sides.
+    pub differences_only: bool,
+    /// Index into [`CompareView::shown`].
+    pub selected: usize,
+    pub offset: usize,
+    /// How many rows fit on screen; the renderer keeps this current.
+    pub page_rows: usize,
+}
+
+impl CompareView {
+    /// Indexes of the comparison's rows that are on show.
+    pub fn shown(&self) -> Vec<usize> {
+        (0..self.comparison.rows.len())
+            .filter(|&i| !self.differences_only || self.comparison.rows[i].status().differs())
+            .collect()
+    }
+}
+
 pub enum Overlay {
     None,
     Help { scroll: u16 },
@@ -398,6 +428,7 @@ pub enum Overlay {
     Filters { selected: usize },
     Record(Record),
     Editor(Editor),
+    Compare(CompareView),
 }
 
 pub struct App {
@@ -410,6 +441,9 @@ pub struct App {
     /// The workspace on screen, or the one Esc on the picker goes back to.
     pub current: usize,
     pub overlay: Overlay,
+    /// Columns held with `v`, to compare other tables with. They are a copy,
+    /// so they outlive the connection they came from.
+    pub held: Option<Snapshot>,
     pub toast: Option<Toast>,
     pub quit: bool,
     pub tick: usize,
@@ -445,6 +479,7 @@ impl App {
             workspaces: Vec::new(),
             current: 0,
             overlay: Overlay::None,
+            held: None,
             toast: None,
             quit: false,
             tick: 0,
@@ -627,7 +662,7 @@ impl App {
 
     fn on_done(&mut self, id: u64, output: Output) {
         let slot = match &output {
-            Output::Opened(_) | Output::Page(_) => Slot::Main,
+            Output::Opened(_) | Output::Page(_) | Output::Columns(..) => Slot::Main,
             Output::Count(_) => Slot::Count,
             Output::Structure(..) => Slot::Aux,
         };
@@ -673,6 +708,10 @@ impl App {
                         Err(error) => Pane::Error(error),
                     };
                 }
+            }
+            Output::Columns(purpose, Ok(snapshot)) => self.on_columns(purpose, *snapshot),
+            Output::Columns(_, Err(error)) => {
+                self.warn(format!("Could not read the columns: {error}"))
             }
         }
     }
@@ -1220,6 +1259,73 @@ impl App {
         }
     }
 
+    /// `v` holds a table's columns, and on another table compares them with
+    /// the ones held. With `hold`, for `V`, the table is held instead. The
+    /// table is the one open, or the one picked in the table list.
+    fn compare(&mut self, hold: bool) {
+        let limits = self.cfg.settings.custom_limits();
+        let purpose = if hold || self.held.is_none() {
+            Purpose::Hold
+        } else {
+            Purpose::Compare
+        };
+        let Some(ws) = self.ws() else { return };
+        let object = match ws.focus {
+            Focus::Sidebar => ws
+                .visible()
+                .get(ws.side.selected)
+                .map(|&i| ws.objects[i].clone()),
+            Focus::Main => ws.table.as_ref().map(|t| t.object.clone()),
+        };
+        let Some(object) = object else {
+            self.say("Open a table first: t jumps to the table list");
+            return;
+        };
+        let session = ws.session.clone();
+        let label = format!("Reading the columns of {}", object.display_name());
+        self.spawn(self.current, Slot::Main, label, async move {
+            let engine = session.engine();
+            let sql = meta::structure_tabs(engine, &object).remove(0).sql;
+            let result = match session.catalog_query(&sql, limits).await {
+                Ok(columns) => {
+                    let table = object.display_name();
+                    let snapshot = Snapshot::new(&session.spec().name, engine, &table, &columns);
+                    if snapshot.columns.is_empty() {
+                        Err(format!("{table} has no columns you can see"))
+                    } else {
+                        Ok(Box::new(snapshot))
+                    }
+                }
+                Err(e) => Err(format!("{e:#}")),
+            };
+            Output::Columns(purpose, result)
+        });
+    }
+
+    fn on_columns(&mut self, purpose: Purpose, snapshot: Snapshot) {
+        match (purpose, &self.held) {
+            (Purpose::Compare, Some(held)) => {
+                // An editor opened in the meantime keeps its text.
+                if !matches!(self.overlay, Overlay::Editor(_)) {
+                    self.overlay = Overlay::Compare(CompareView {
+                        comparison: Comparison::new(held.clone(), snapshot),
+                        differences_only: false,
+                        selected: 0,
+                        offset: 0,
+                        page_rows: 10,
+                    });
+                }
+            }
+            _ => {
+                self.say(format!(
+                    "Holding the columns of {}: v on another table compares with them",
+                    snapshot.table
+                ));
+                self.held = Some(snapshot);
+            }
+        }
+    }
+
     fn open_editor(&mut self) {
         let Some(ws) = self.ws_mut() else { return };
         let text = ws
@@ -1308,6 +1414,7 @@ impl App {
             Overlay::Filters { selected } => self.filters_key(selected, key),
             Overlay::Record(record) => self.record_key(record, key),
             Overlay::Editor(editor) => self.editor_key(editor, key),
+            Overlay::Compare(view) => self.compare_key(view, key),
         }
     }
 
@@ -1437,6 +1544,8 @@ impl App {
             KeyCode::Char('r') if !is_ctrl(&key) => self.cycle(true),
             KeyCode::Char('R') => self.cycle(false),
             KeyCode::Char('e') => self.open_editor(),
+            KeyCode::Char('v') => self.compare(false),
+            KeyCode::Char('V') => self.compare(true),
             KeyCode::Char('t') => {
                 ws.focus = Focus::Sidebar;
                 ws.side.filtering = true;
@@ -1728,6 +1837,33 @@ impl App {
             grid.col = field.min(grid.cols().saturating_sub(1));
             grid.step_rows(row_step);
         }
+    }
+
+    fn compare_key(&mut self, mut view: CompareView, key: KeyEvent) {
+        let shown = view.shown();
+        let last = shown.len().saturating_sub(1);
+        let page = view.page_rows.max(2);
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'v') => return,
+            KeyCode::Down | KeyCode::Char('j') => view.selected = (view.selected + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => view.selected = view.selected.saturating_sub(1),
+            KeyCode::PageDown => view.selected = (view.selected + page - 1).min(last),
+            KeyCode::PageUp => view.selected = view.selected.saturating_sub(page - 1),
+            KeyCode::Home | KeyCode::Char('g') => view.selected = 0,
+            KeyCode::End | KeyCode::Char('G') => view.selected = last,
+            KeyCode::Char('d') => {
+                // Stay on the same column, or the next one still shown.
+                let row = shown.get(view.selected).copied().unwrap_or(0);
+                view.differences_only = !view.differences_only;
+                let now = view.shown();
+                view.selected = now
+                    .iter()
+                    .position(|&i| i >= row)
+                    .unwrap_or(now.len().saturating_sub(1));
+            }
+            _ => {}
+        }
+        self.overlay = Overlay::Compare(view);
     }
 
     fn editor_key(&mut self, mut editor: Editor, key: KeyEvent) {

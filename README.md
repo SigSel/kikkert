@@ -11,6 +11,7 @@ distance, and never touches it.
 - **Search without writing SQL:** pick a column, how to match and a value.
   kikkert writes the SQL, shows it, and lets you edit it.
 - **Sort, page, find duplicates, inspect structure**, all from the keyboard.
+- **Compare two tables' columns**, across connections and even across engines.
 - **Read-only by construction:** see [How read-only is enforced](#how-read-only-is-enforced).
 
 ## Install
@@ -142,6 +143,8 @@ Press `?` at any time for the full list of keys.
 | `Backspace` | go back |
 | `1`–`5` | Data, Columns, Indexes, Keys, Definition |
 | `e` | edit the SQL; `F5` or `Ctrl-R` runs it |
+| `v` | hold this table's columns; on another table, compare the two |
+| `V` | hold this table's columns in place of the ones held |
 | `y` `Y` | copy the cell or the row |
 | `Esc` | cancel a running query |
 | `c` | open another connection alongside this one; `Esc` comes back |
@@ -154,6 +157,14 @@ Press `?` at any time for the full list of keys.
 Each open connection gets a tab in the title bar. Queries keep running in a
 connection you have switched away from, and its tab shows a spinner until
 they finish.
+
+`v` holds the columns of a table, the one open or the one picked in the table
+list, and `v` on another table shows the two side by side: names, types,
+whether they take NULL, defaults and keys, never the rows. The other table can
+be in another connection, even on another engine. Types and defaults that two
+engines spell differently, such as `integer` and `int` or `true` and `1`, are
+marked as alike rather than different, and `d` narrows the list to the real
+differences. The held table is named in the title bar until `V` holds another.
 
 Filtering "contains" works on any column, not only text: numbers, dates and
 ids are compared as text, so `2024-03` finds March and `42` finds order 1042.

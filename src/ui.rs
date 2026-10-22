@@ -15,8 +15,10 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, FilterDialog, FilterField, Focus, Grid, Overlay, Pane, Record, Screen, Total, Workspace,
+    App, CompareView, FilterDialog, FilterField, Focus, Grid, Overlay, Pane, Record, Screen, Total,
+    Workspace,
 };
+use crate::compare::{Comparison, Row, Snapshot, Status, Verdict};
 use crate::db::Engine;
 use crate::db::meta::ObjectKind;
 use crate::input::{Editor, Input};
@@ -341,6 +343,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 draw_record(frame, body, record, grid);
             }
         }
+        Overlay::Compare(view) => draw_compare(frame, body, view),
         Overlay::None | Overlay::Editor(_) => {}
     }
 }
@@ -355,11 +358,23 @@ fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     )];
     // The badge keeps its place however long the connection details are.
-    let badge = Line::from(vec![
+    // It also names the table held for comparing, which is not tied to any
+    // one connection.
+    let mut badge = Vec::new();
+    if let Some(held) = &app.held {
+        badge.extend([
+            Span::styled(" ⇄ ", accent()),
+            Span::styled(
+                format!("{} ", fit(&held.table, 28, false).trim_end()),
+                subtle(),
+            ),
+        ]);
+    }
+    badge.extend([
         Span::styled(" ● ", good()),
         Span::styled("read-only ", subtle()),
-    ])
-    .style(Style::new().bg(t.surface));
+    ]);
+    let badge = Line::from(badge).style(Style::new().bg(t.surface));
     let width = (badge.width() as u16).min(area.width);
     let [text_area, _, badge_area] = Layout::horizontal([
         Constraint::Min(0),
@@ -495,6 +510,7 @@ fn hints(app: &App) -> Hints {
                 ("Tab", "data"),
                 ("e", "SQL"),
                 ("c", "connect"),
+                ("v", "compare"),
                 ("?", "help"),
             ],
             Focus::Main if ws.tab != 0 => &[
@@ -521,6 +537,7 @@ fn hints(app: &App) -> Hints {
                 ("d", "duplicates"),
                 ("Enter", "row"),
                 ("e", "SQL"),
+                ("v", "compare"),
                 ("?", "help"),
             ],
         },
@@ -1753,6 +1770,354 @@ fn draw_record(frame: &mut Frame, area: Rect, record: &mut Record, grid: &Grid) 
     frame.render_widget(body.scroll((record.scroll, 0)), value_area);
 }
 
+/// How a line of a comparison is marked, in the list and in the summary.
+fn status_mark(status: Status) -> (&'static str, Style) {
+    match status {
+        Status::Same => ("=", faint()),
+        Status::Alike => ("≈", subtle()),
+        Status::Different => ("≠", Style::new().fg(theme().warn)),
+        Status::OnlyLeft => ("−", bad()),
+        Status::OnlyRight => ("+", good()),
+    }
+}
+
+/// One attribute of one line of a comparison: the value when both sides
+/// agree, both values when they do not.
+fn compare_cell(comparison: &Comparison, row: &Row, k: usize) -> (String, Style) {
+    let (left, right) = comparison.values(row, &comparison.attributes[k]);
+    let shown = |v: Option<&str>| {
+        v.filter(|v| !v.trim().is_empty())
+            .unwrap_or("–")
+            .to_string()
+    };
+    let both = |join: &str| format!("{} {join} {}", shown(left), shown(right));
+    match (row.status(), row.cells[k]) {
+        (Status::OnlyLeft, _) => (left.unwrap_or("").to_string(), bad()),
+        (Status::OnlyRight, _) => (right.unwrap_or("").to_string(), good()),
+        (_, Some(Verdict::Same)) => (left.unwrap_or("").to_string(), Style::new()),
+        (_, Some(Verdict::Alike)) => (both("≈"), subtle()),
+        (_, Some(Verdict::Different)) => (both("→"), Style::new().fg(theme().warn)),
+        // Only one side reports this.
+        (_, None) => (left.or(right).unwrap_or("").to_string(), muted()),
+    }
+}
+
+fn compare_name(comparison: &Comparison, row: &Row) -> (String, Style) {
+    match (comparison.names(row), row.status()) {
+        ((Some(left), _), Status::OnlyLeft) => (left.to_string(), bad()),
+        ((_, Some(right)), Status::OnlyRight) => (right.to_string(), good()),
+        ((Some(left), Some(right)), _) if row.name == Verdict::Alike => {
+            (format!("{left} ≈ {right}"), Style::new())
+        }
+        ((left, right), _) => (left.or(right).unwrap_or("").to_string(), Style::new()),
+    }
+}
+
+/// Narrows the widest of `widths` until they add up to `room`, or all are
+/// down to `min`.
+fn squeeze(widths: &mut [usize], room: usize, min: usize) {
+    while widths.iter().sum::<usize>() > room {
+        let Some((i, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w > min)
+            .max_by_key(|(_, w)| **w)
+        else {
+            return;
+        };
+        widths[i] -= 1;
+    }
+}
+
+/// Two tables' columns: a line per column, and below them both sides of the
+/// one under the cursor in full.
+fn draw_compare(frame: &mut Frame, area: Rect, view: &mut CompareView) {
+    let t = theme();
+    let shown = view.shown();
+    let comparison = &view.comparison;
+    let attributes = &comparison.attributes;
+    let (left_label, right_label) = comparison.labels();
+
+    // Which table is which.
+    let side = |s: &Snapshot| {
+        vec![
+            Span::styled(s.connection.clone(), Style::new().fg(t.engine(s.engine))),
+            Span::styled(" · ", faint()),
+            Span::styled(s.table.clone(), bold()),
+        ]
+    };
+    let mut heading = side(&comparison.left);
+    heading.push(Span::styled("  →  ", accent()));
+    heading.extend(side(&comparison.right));
+    let heading = Line::from(heading);
+
+    // How many of each.
+    let mut summary = Vec::new();
+    if !comparison.rows.iter().any(|r| r.status().differs()) {
+        summary.push(Span::styled(
+            "✓ No differences   ",
+            good().add_modifier(Modifier::BOLD),
+        ));
+    }
+    for (status, what) in [
+        (Status::Different, "differ".to_string()),
+        (Status::OnlyLeft, format!("only in {left_label}")),
+        (Status::OnlyRight, format!("only in {right_label}")),
+        (Status::Alike, "alike".to_string()),
+        (Status::Same, "the same".to_string()),
+    ] {
+        let count = comparison.count(status);
+        if count == 0 {
+            continue;
+        }
+        let (mark, style) = status_mark(status);
+        summary.extend([
+            Span::styled(format!("{mark} "), style),
+            Span::raw(format!("{count} ")),
+            Span::styled(format!("{what}   "), muted()),
+        ]);
+    }
+    let summary = Line::from(summary);
+
+    // The list: a mark, the name, then each attribute. The widths come from
+    // every line, so hiding the ones that match leaves the columns in place.
+    let names: Vec<(String, Style)> = comparison
+        .rows
+        .iter()
+        .map(|row| compare_name(comparison, row))
+        .collect();
+    let cells: Vec<Vec<(String, Style)>> = comparison
+        .rows
+        .iter()
+        .map(|row| {
+            (0..attributes.len())
+                .map(|k| compare_cell(comparison, row, k))
+                .collect()
+        })
+        .collect();
+    // An attribute that is empty on every line is only shown below.
+    let listed: Vec<usize> = (0..attributes.len())
+        .filter(|&k| cells.iter().any(|row| !row[k].0.is_empty()))
+        .collect();
+    let mut widths = vec![
+        names
+            .iter()
+            .map(|(name, _)| text_width(name))
+            .chain([text_width("column")])
+            .max()
+            .unwrap_or(0)
+            .min(36),
+    ];
+    for &k in &listed {
+        widths.push(
+            cells
+                .iter()
+                .map(|row| text_width(&row[k].0))
+                .chain([text_width(&attributes[k])])
+                .max()
+                .unwrap_or(0)
+                .min(40),
+        );
+    }
+    // Three for the bar and the mark, two between columns.
+    let gaps = 3 + 2 * listed.len();
+
+    // The box is as big as what it shows, within the screen.
+    let detail_height = attributes.len() as u16 + 3;
+    let content_width = (gaps + widths.iter().sum::<usize>())
+        .max(heading.width())
+        .max(summary.width())
+        .max(72) as u16;
+    let content_height = 4 + comparison.rows.len() as u16 + 1 + detail_height;
+    let at = centered(
+        area,
+        (content_width + 4).min(area.width.saturating_sub(6)),
+        (content_height + 2)
+            .max(16)
+            .min(area.height.saturating_sub(2)),
+    );
+    let toggle = if view.differences_only {
+        ("d", "all columns")
+    } else {
+        ("d", "only differences")
+    };
+    let inner = popup(
+        frame,
+        at,
+        "Compare columns",
+        &[("↑↓", "column"), toggle, ("Esc", "close")],
+    );
+    if inner.height < 8 || inner.width < 30 {
+        return;
+    }
+    let room = inner.width as usize;
+    squeeze(&mut widths, room.saturating_sub(gaps), 4);
+
+    let detail_height = detail_height.min(inner.height / 2);
+    let [heading_area, summary_area, _, list_area, _, detail_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(2),
+        Constraint::Length(1),
+        Constraint::Length(detail_height),
+    ])
+    .areas(inner);
+
+    let heading = if heading.width() <= room {
+        heading
+    } else {
+        Line::raw(fit(&heading.to_string(), room, false))
+    };
+    frame.render_widget(Paragraph::new(heading), heading_area);
+    frame.render_widget(Paragraph::new(summary), summary_area);
+
+    let body = list_area.height.saturating_sub(1) as usize;
+    view.page_rows = body;
+    view.selected = view.selected.min(shown.len().saturating_sub(1));
+    if view.selected < view.offset {
+        view.offset = view.selected;
+    } else if body > 0 && view.selected >= view.offset + body {
+        view.offset = view.selected + 1 - body;
+    }
+    view.offset = view.offset.min(shown.len().saturating_sub(body));
+
+    let mut header = vec![Span::raw(format!("   {}", fit("column", widths[0], false)))];
+    for (n, &k) in listed.iter().enumerate() {
+        header.push(Span::raw(format!(
+            "  {}",
+            fit(&attributes[k], widths[n + 1], false)
+        )));
+    }
+    let mut lines = vec![Line::from(header).style(Style::new().bg(t.surface).fg(t.subtle))];
+    for (line, &i) in shown.iter().enumerate().skip(view.offset).take(body) {
+        let selected = line == view.selected;
+        let (mark, mark_style) = status_mark(comparison.rows[i].status());
+        let (name, name_style) = &names[i];
+        let mut spans = vec![
+            Span::styled(if selected { "▌" } else { " " }, accent()),
+            Span::styled(format!("{mark} "), mark_style),
+            Span::styled(
+                fit(name, widths[0], false),
+                if selected {
+                    highlight(true).patch(*name_style)
+                } else {
+                    *name_style
+                },
+            ),
+        ];
+        for (n, &k) in listed.iter().enumerate() {
+            let (text, style) = &cells[i][k];
+            spans.push(Span::styled(
+                format!("  {}", fit(text, widths[n + 1], false)),
+                *style,
+            ));
+        }
+        let mut line = Line::from(spans);
+        if selected {
+            line = line.style(Style::new().bg(t.surface).fg(t.text));
+        }
+        lines.push(line);
+    }
+    frame.render_widget(Paragraph::new(lines), list_area);
+    if shown.is_empty() {
+        draw_centered(
+            frame,
+            Rect {
+                y: list_area.y + 1,
+                height: list_area.height.saturating_sub(1),
+                ..list_area
+            },
+            vec![Line::from(vec![
+                Span::styled("No differences. ", muted()),
+                Span::styled("d", accent()),
+                Span::styled(" shows every column.", muted()),
+            ])],
+        );
+    }
+    let track = Rect {
+        x: at.right().saturating_sub(1),
+        y: list_area.y + 1,
+        width: 1,
+        height: list_area.height.saturating_sub(1),
+    };
+    scrollbar(frame, track, view.offset, body, shown.len(), true);
+
+    // Both sides of the column under the cursor, in full.
+    let Some(row) = shown.get(view.selected).map(|&i| &comparison.rows[i]) else {
+        return;
+    };
+    let status = row.status();
+    let (name, _) = compare_name(comparison, row);
+    let verdict = match status {
+        Status::Same => "the same".to_string(),
+        Status::Alike => "alike: spelled differently, meaning the same".to_string(),
+        Status::Different => "differs".to_string(),
+        Status::OnlyLeft => format!("only in {left_label}"),
+        Status::OnlyRight => format!("only in {right_label}"),
+    };
+    let mut rule = vec![
+        Span::styled("── ", faint()),
+        Span::styled(name, accent().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {verdict}"), status_mark(status).1),
+    ];
+    let used = Line::from(rule.clone()).width() + 1;
+    rule.push(Span::styled(
+        format!(" {}", "─".repeat(room.saturating_sub(used))),
+        faint(),
+    ));
+
+    let label_width = attributes
+        .iter()
+        .map(|a| text_width(a))
+        .chain([text_width("position")])
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let value_width = room.saturating_sub(label_width + 4) / 2;
+    let pair = |label: &str, left: (String, Style), right: (String, Style)| {
+        Line::from(vec![
+            Span::styled(format!("  {}", fit(label, label_width, false)), muted()),
+            Span::styled(format!("{}  ", fit(&left.0, value_width, false)), left.1),
+            Span::styled(fit(&right.0, value_width, false), right.1),
+        ])
+    };
+    let value = |v: Option<&str>, style: Style| match v.filter(|v| !v.trim().is_empty()) {
+        Some(v) => (v.to_string(), style),
+        None => ("–".to_string(), muted()),
+    };
+    let side_label = |s: &Snapshot, label: String| (label, bold().fg(t.engine(s.engine)));
+    let mut detail = vec![
+        Line::from(rule),
+        pair(
+            "",
+            side_label(&comparison.left, left_label),
+            side_label(&comparison.right, right_label),
+        ),
+        pair(
+            "position",
+            value(
+                row.left.map(|i| (i + 1).to_string()).as_deref(),
+                Style::new(),
+            ),
+            value(
+                row.right.map(|j| (j + 1).to_string()).as_deref(),
+                Style::new(),
+            ),
+        ),
+    ];
+    for (k, attribute) in attributes.iter().enumerate() {
+        let (left, right) = comparison.values(row, attribute);
+        let style = match row.cells[k] {
+            Some(Verdict::Different) => Style::new().fg(t.warn),
+            Some(Verdict::Alike) => subtle(),
+            _ => Style::new(),
+        };
+        detail.push(pair(attribute, value(left, style), value(right, style)));
+    }
+    frame.render_widget(Paragraph::new(detail), detail_area);
+}
+
 /// JSON reads better indented and coloured; everything else is shown as it
 /// is.
 fn pretty(value: &str) -> Text<'static> {
@@ -1824,6 +2189,14 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
                 ("Space", "mark columns, to check a combination with d"),
                 ("Enter", "show the rows behind a line"),
                 ("Backspace", "go back"),
+            ],
+        ),
+        (
+            "Compare tables",
+            &[
+                ("v", "hold this table's columns; on another, compare"),
+                ("V", "hold this table's columns instead"),
+                ("d", "in a comparison: only the differences"),
             ],
         ),
         (

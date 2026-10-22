@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use kikkert::compare::{Comparison, Snapshot, Status};
 use kikkert::db::meta::{self, DbObject, ObjectKind};
 use kikkert::db::{ConnectionSpec, Engine, Limits, ResultSet, Session, TlsMode};
 use kikkert::query::{ColumnInfo, Dir, Filter, Mode, Op, TableQuery};
@@ -110,6 +111,16 @@ impl Db {
         out
     }
 
+    async fn snapshot(&self, name: &str) -> Snapshot {
+        let tabs = self.structure(name).await;
+        Snapshot::new(
+            &format!("test-{}", self.engine.label()),
+            self.engine,
+            &self.object(name).display_name(),
+            &tabs[0].1,
+        )
+    }
+
     async fn table(&self, name: &str, page_size: usize) -> TableQuery {
         let tabs = self.structure(name).await;
         let columns = meta::parse_columns(&tabs[0].1);
@@ -214,6 +225,19 @@ async fn exercise(engine: Engine) {
         text(definition).to_lowercase().contains("customers"),
         "{definition:?}"
     );
+
+    // --- comparing structure -----------------------------------------------
+    let customers = db.snapshot("customers").await;
+    let itself = Comparison::new(customers.clone(), db.snapshot("customers").await);
+    assert_eq!(
+        itself.count(Status::Same),
+        10,
+        "a table is the same as itself"
+    );
+    let other = Comparison::new(customers, db.snapshot("empty_table").await);
+    assert_eq!(other.count(Status::Same), 1, "id is in both");
+    assert_eq!(other.count(Status::OnlyLeft), 9);
+    assert_eq!(other.count(Status::OnlyRight), 1, "label");
 
     // --- the data, as it should be displayed -------------------------------
     let query = db.table("customers", 50).await;
@@ -522,6 +546,48 @@ async fn mssql() {
 #[tokio::test]
 async fn sqlite() {
     exercise(Engine::Sqlite).await;
+}
+
+/// The same table on two engines: types and defaults that each engine spells
+/// its own way compare alike, and only real differences are left.
+#[tokio::test]
+async fn one_table_compared_across_engines() {
+    use Status::{Alike, Different, Same};
+    let Some(postgres) = Db::open(Engine::Postgres).await else {
+        return;
+    };
+    let base = postgres.snapshot("customers").await;
+    for engine in [Engine::Mysql, Engine::Mssql, Engine::Sqlite] {
+        let Some(db) = Db::open(engine).await else {
+            continue;
+        };
+        let comparison = Comparison::new(base.clone(), db.snapshot("customers").await);
+        assert_eq!(comparison.rows.len(), 10, "{engine:?}: every column paired");
+        let expected = match engine {
+            Engine::Mssql => [Alike, Different, Alike, Alike, Alike, Different],
+            _ => [Alike, Same, Alike, Alike, Different, Different],
+        };
+        for (column, status) in ["email", "name", "active", "created_at", "token", "meta"]
+            .into_iter()
+            .zip(expected)
+        {
+            let row = comparison
+                .rows
+                .iter()
+                .find(|r| comparison.names(r).0 == Some(column))
+                .unwrap();
+            assert_eq!(
+                row.status(),
+                status,
+                "{engine:?} {column}: {:?}",
+                comparison
+                    .attributes
+                    .iter()
+                    .map(|a| comparison.values(row, a))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }
 
 #[tokio::test]

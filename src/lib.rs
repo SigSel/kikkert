@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod clipboard;
+pub mod compare;
 pub mod config;
 pub mod db;
 pub mod input;
