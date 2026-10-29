@@ -4,8 +4,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::supports_keyboard_enhancement;
 use tokio::sync::mpsc;
 
 use kikkert::app::{App, Msg};
@@ -177,6 +181,16 @@ async fn interface(
 
     let mut terminal = ratatui::try_init().context("Could not take over the terminal")?;
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    // Terminals that speak the kitty keyboard protocol tell Ctrl-Enter from
+    // Enter, but only when asked. Asking must come before the key thread
+    // starts, since the answer arrives as input.
+    let enhanced = supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced {
+        let _ = execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
 
     // Keys are read on their own thread so a slow redraw never drops one.
     std::thread::spawn(move || {
@@ -204,6 +218,9 @@ async fn interface(
         }
     };
 
+    if enhanced {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     outcome

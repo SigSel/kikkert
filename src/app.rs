@@ -301,6 +301,12 @@ impl Workspace {
             .collect()
     }
 
+    /// The table or view highlighted in the table list.
+    pub fn selected_object(&self) -> Option<&DbObject> {
+        let index = *self.visible().get(self.side.selected)?;
+        self.objects.get(index)
+    }
+
     pub fn tab_titles(&self) -> Vec<&'static str> {
         let mut titles = vec!["Data"];
         if let Some(table) = &self.table {
@@ -444,6 +450,9 @@ pub struct App {
     /// Columns held with `v`, to compare other tables with. They are a copy,
     /// so they outlive the connection they came from.
     pub held: Option<Snapshot>,
+    /// What was copied last, for Ctrl-V where the clipboard cannot be read
+    /// back, as over SSH.
+    copied: Option<String>,
     pub toast: Option<Toast>,
     pub quit: bool,
     pub tick: usize,
@@ -480,6 +489,7 @@ impl App {
             current: 0,
             overlay: Overlay::None,
             held: None,
+            copied: None,
             toast: None,
             quit: false,
             tick: 0,
@@ -1173,9 +1183,9 @@ impl App {
             };
         });
         self.say(if duplicates_only {
-            format!("Duplicates of {what}. Enter shows the rows, Backspace goes back")
+            format!("Duplicates of {what}. Enter shows the rows, Esc goes back")
         } else {
-            format!("Values of {what}. Enter shows the rows, Backspace goes back")
+            format!("Values of {what}. Enter shows the rows, Esc goes back")
         });
     }
 
@@ -1253,9 +1263,23 @@ impl App {
                 _ => (String::new(), "cell"),
             }
         };
+        self.copy(text, what);
+    }
+
+    fn copy(&mut self, text: String, what: &str) {
         match clipboard::copy(&text) {
             Ok(how) => self.say(format!("Copied {what} ({how})")),
             Err(error) => self.warn(format!("Could not copy: {error}")),
+        }
+        self.copied = Some(text);
+    }
+
+    /// Ctrl-V: the clipboard goes into the field being typed in, as a paste
+    /// from the terminal would.
+    fn paste(&mut self) {
+        match clipboard::paste().or_else(|| self.copied.clone()) {
+            Some(text) => self.on_paste(&text),
+            None => self.say("There is nothing to paste"),
         }
     }
 
@@ -1271,10 +1295,7 @@ impl App {
         };
         let Some(ws) = self.ws() else { return };
         let object = match ws.focus {
-            Focus::Sidebar => ws
-                .visible()
-                .get(ws.side.selected)
-                .map(|&i| ws.objects[i].clone()),
+            Focus::Sidebar => ws.selected_object().cloned(),
             Focus::Main => ws.table.as_ref().map(|t| t.object.clone()),
         };
         let Some(object) = object else {
@@ -1365,6 +1386,19 @@ impl App {
 
     // ---- keys -------------------------------------------------------------
 
+    /// Whether keys go into a text field, where a paste lands.
+    fn typing(&self) -> bool {
+        match &self.overlay {
+            Overlay::Editor(_) => true,
+            Overlay::Filter(dialog) => dialog.focus != FilterField::Operator,
+            Overlay::None => match self.screen {
+                Screen::Picker => self.picker.filtering,
+                Screen::Workspace => self.ws().is_some_and(|ws| ws.side.filtering),
+            },
+            _ => false,
+        }
+    }
+
     fn on_paste(&mut self, text: &str) {
         match &mut self.overlay {
             Overlay::Editor(editor) => editor.insert_str(text),
@@ -1392,6 +1426,10 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) {
         if is_ctrl(&key) && key.code == KeyCode::Char('c') {
             self.quit = true;
+            return;
+        }
+        if is_ctrl(&key) && key.code == KeyCode::Char('v') && self.typing() {
+            self.paste();
             return;
         }
         match std::mem::replace(&mut self.overlay, Overlay::None) {
@@ -1522,7 +1560,17 @@ impl App {
                     ws.side.filter.clear();
                     ws.side.selected = 0;
                 }
-                KeyCode::Enter => self.open_selected(),
+                // Ctrl-Enter opens the highlighted match straight away. Alt-Enter
+                // does too, for terminals that cannot tell Ctrl-Enter from Enter.
+                KeyCode::Enter
+                    if key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.open_selected()
+                }
+                // Enter stops typing, to move through the matches.
+                KeyCode::Enter => ws.side.filtering = false,
                 KeyCode::Down => ws.side.selected = (ws.side.selected + 1).min(last),
                 KeyCode::Up => ws.side.selected = ws.side.selected.saturating_sub(1),
                 KeyCode::Tab => ws.side.filtering = false,
@@ -1583,6 +1631,11 @@ impl App {
                 side.selected = 0;
             }
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self.open_selected(),
+            KeyCode::Char('y') => {
+                if let Some(name) = ws.selected_object().map(DbObject::display_name) {
+                    self.copy(name, "table name");
+                }
+            }
             _ => {}
         }
     }
@@ -1612,6 +1665,11 @@ impl App {
             KeyCode::Char('Y') => self.yank(true),
             _ if is_run(&key) => self.reload(),
             KeyCode::Backspace if ws.tab == 0 => self.go_back(),
+            // Esc also backs out of duplicates and the rows shown from them,
+            // but does not leave hand-written SQL, which is easy to lose.
+            KeyCode::Esc if ws.tab == 0 && ws.custom.is_none() && !ws.back.is_empty() => {
+                self.go_back()
+            }
             KeyCode::Char(']') | KeyCode::Char('n') if ws.tab == 0 => self.turn_page(true),
             KeyCode::Char('[') | KeyCode::Char('p') if ws.tab == 0 => self.turn_page(false),
             KeyCode::Char('/' | 'f' | '=' | '!' | 'F' | 'X' | 's' | 'S' | ' ' | 'd' | 'D') => {
@@ -1647,7 +1705,7 @@ impl App {
                 self.say("All filters cleared");
             }
             _ if in_groups => {
-                self.say("Enter shows the rows behind this line; Backspace goes back to the table")
+                self.say("Enter shows the rows behind this line; Esc goes back to the table")
             }
             KeyCode::Char('/' | 'f') => self.open_filter(),
             KeyCode::Char('=') => self.quick_filter(Op::Equals),

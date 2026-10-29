@@ -501,12 +501,24 @@ fn hints(app: &App) -> Hints {
             ("q", "quit"),
         ],
         (Overlay::None, Screen::Workspace, Some(ws)) => match ws.focus {
-            Focus::Sidebar if ws.side.filtering => {
-                &[("", "type to filter"), ("Enter", "open"), ("Esc", "clear")]
-            }
+            Focus::Sidebar if ws.side.filtering => &[
+                ("", "type to filter"),
+                ("Enter", "browse"),
+                ("Ctrl-Enter", "open"),
+                ("Esc", "clear"),
+            ],
+            Focus::Sidebar if !ws.side.filter.is_empty() => &[
+                ("Enter", "open"),
+                ("/", "filter"),
+                ("Esc", "clear"),
+                ("y", "copy"),
+                ("Tab", "data"),
+                ("?", "help"),
+            ],
             Focus::Sidebar => &[
                 ("Enter", "open"),
                 ("/", "filter"),
+                ("y", "copy"),
                 ("Tab", "data"),
                 ("e", "SQL"),
                 ("c", "connect"),
@@ -527,7 +539,7 @@ fn hints(app: &App) -> Hints {
             ],
             Focus::Main if ws.groups().is_some() => &[
                 ("Enter", "show rows"),
-                ("Backspace", "back"),
+                ("Esc", "back"),
                 ("]", "next"),
                 ("?", "help"),
             ],
@@ -1404,7 +1416,12 @@ fn draw_filter(frame: &mut Frame, area: Rect, dialog: &FilterDialog, ws: &Worksp
         frame,
         at,
         "Filter",
-        &[("Tab", "next field"), ("Enter", "apply"), ("Esc", "cancel")],
+        &[
+            ("Tab", "next field"),
+            ("Ctrl-V", "paste"),
+            ("Enter", "apply"),
+            ("Esc", "cancel"),
+        ],
     );
     if inner.height < 7 {
         return;
@@ -2138,7 +2155,12 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
             &[
                 ("?", "this help"),
                 ("Tab", "switch between the table list and the data"),
-                ("t", "find a table by name"),
+                ("t", "find a table by name; Enter browses the matches"),
+                (
+                    "Ctrl-Enter",
+                    "while finding a table: open the one highlighted",
+                ),
+                ("Ctrl-V", "paste into a filter or the SQL editor"),
                 ("e", "edit and run SQL"),
                 ("1 … 5", "Data, Columns, Indexes, Keys, Definition"),
                 ("Esc", "cancel a running query, close a dialog"),
@@ -2163,7 +2185,10 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
                 ("PgUp  PgDn", "a screen at a time"),
                 ("]  [", "next and previous page"),
                 ("Enter", "show the whole row"),
-                ("y  Y", "copy the cell, copy the row"),
+                (
+                    "y  Y",
+                    "copy the cell, the row; in the table list, the name",
+                ),
                 ("F5  Ctrl-R", "run again"),
             ],
         ),
@@ -2188,7 +2213,7 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
                 ("D", "every value of this column and how often it occurs"),
                 ("Space", "mark columns, to check a combination with d"),
                 ("Enter", "show the rows behind a line"),
-                ("Backspace", "go back"),
+                ("Esc  Backspace", "go back"),
             ],
         ),
         (

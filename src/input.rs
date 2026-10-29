@@ -85,8 +85,10 @@ impl Input {
     }
 
     pub fn insert_str(&mut self, text: &str) {
-        // A pasted newline would be invisible in a one-line field.
+        // A pasted newline would be invisible in a one-line field, and one at
+        // the end, copied along with a line, would turn into a stray space.
         let clean: String = text
+            .trim_end_matches(['\r', '\n'])
             .chars()
             .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
             .filter(|c| !c.is_control())
@@ -356,6 +358,9 @@ mod tests {
         let mut input = Input::default();
         input.insert_str("a\nb\tc\u{7}");
         assert_eq!(input.text(), "a b c");
+        input.clear();
+        input.insert_str("1042\r\n");
+        assert_eq!(input.text(), "1042");
     }
 
     #[test]

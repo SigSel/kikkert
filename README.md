@@ -135,7 +135,7 @@ Press `?` at any time for the full list of keys.
 | Key | What it does |
 |---|---|
 | `Tab` | switch between the table list and the data |
-| `t` | find a table by typing part of its name |
+| `t` | find a table by typing part of its name; `Enter` moves into the matches, `Ctrl-Enter` opens the highlighted one |
 | `Enter` | open the table; on data, show the whole row |
 | arrows or `h j k l`, `g G`, `0 $` | move around |
 | `]` `[` | next and previous page |
@@ -151,14 +151,24 @@ Press `?` at any time for the full list of keys.
 | `e` | edit the SQL; `F5` or `Ctrl-R` runs it |
 | `v` | hold this table's columns; on another table, compare the two |
 | `V` | hold this table's columns in place of the ones held |
-| `y` `Y` | copy the cell or the row |
-| `Esc` | cancel a running query |
+| `y` `Y` | copy the cell or the row; in the table list, the table's name |
+| `Ctrl-V` | paste into a filter, the table finder or the SQL editor |
+| `Esc` | cancel a running query; in duplicates, go back as `Backspace` does |
 | `c` | open another connection alongside this one; `Esc` comes back |
 | `C` | open another connection in place of this one, which closes once the new one is connected |
 | `r` `R` | next and previous open connection |
 | `F5` or `Ctrl-R` | run again |
 | `q` | close this connection; the last one goes back to the connection list |
 | `Q` | quit |
+
+`Ctrl-Enter` needs a terminal that can tell it from `Enter`, as those that
+speak the kitty keyboard protocol can (kitty, foot, Ghostty and Alacritty among
+them). `Alt-Enter` does the same in any terminal.
+
+`y` copies with `wl-copy`, `xclip`, `xsel` or `pbcopy`, whichever is there, and
+otherwise through the terminal (OSC 52), which also works over SSH. `Ctrl-V`
+reads the clipboard back the same way; where it cannot, as over SSH, it pastes
+what kikkert copied last. The terminal's own paste works in the same fields.
 
 Each open connection gets a tab in the title bar. Queries keep running in a
 connection you have switched away from, and its tab shows a spinner until

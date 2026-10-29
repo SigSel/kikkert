@@ -1,32 +1,74 @@
-//! Copying to the system clipboard without linking a clipboard library:
-//! use whichever helper the desktop provides, and fall back to the OSC 52
-//! terminal escape, which also works over SSH.
+//! The system clipboard without linking a clipboard library: use whichever
+//! helper the desktop provides. Copying falls back to the OSC 52 terminal
+//! escape, which also works over SSH.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// Copies `text` and says how, for the status line.
-pub fn copy(text: &str) -> Result<&'static str, String> {
-    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let x11 = std::env::var_os("DISPLAY").is_some();
-    let mut helpers: Vec<(&'static str, &[&str])> = Vec::new();
-    if wayland {
-        helpers.push(("wl-copy", &[]));
+type Run = (&'static str, &'static [&'static str]);
+
+/// A clipboard helper: the command that copies and the one that pastes.
+struct Helper {
+    copy: Run,
+    paste: Run,
+}
+
+/// The helpers this desktop may have, best first.
+fn helpers() -> Vec<Helper> {
+    let mut helpers = Vec::new();
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        helpers.push(Helper {
+            copy: ("wl-copy", &[]),
+            paste: ("wl-paste", &["--no-newline", "--type", "text"]),
+        });
     }
-    if x11 {
-        helpers.push(("xclip", &["-selection", "clipboard"]));
-        helpers.push(("xsel", &["--clipboard", "--input"]));
+    if std::env::var_os("DISPLAY").is_some() {
+        helpers.push(Helper {
+            copy: ("xclip", &["-selection", "clipboard"]),
+            paste: ("xclip", &["-selection", "clipboard", "-o"]),
+        });
+        helpers.push(Helper {
+            copy: ("xsel", &["--clipboard", "--input"]),
+            paste: ("xsel", &["--clipboard", "--output"]),
+        });
     }
     if cfg!(target_os = "macos") {
-        helpers.push(("pbcopy", &[]));
+        helpers.push(Helper {
+            copy: ("pbcopy", &[]),
+            paste: ("pbpaste", &[]),
+        });
     }
+    helpers
+}
 
-    for (program, args) in helpers {
+/// Copies `text` and says how, for the status line.
+pub fn copy(text: &str) -> Result<&'static str, String> {
+    for helper in helpers() {
+        let (program, args) = helper.copy;
         if pipe_to(program, args, text) {
             return Ok(program);
         }
     }
     osc52(text).map(|()| "terminal").map_err(|e| e.to_string())
+}
+
+/// The text on the clipboard, or `None` when there is no helper to read it
+/// with, or nothing on it that is text. There is no terminal fallback: few
+/// terminals let a program read the clipboard.
+pub fn paste() -> Option<String> {
+    helpers().into_iter().find_map(|helper| {
+        let (program, args) = helper.paste;
+        let output = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())?;
+        String::from_utf8(output.stdout)
+            .ok()
+            .filter(|text| !text.is_empty())
+    })
 }
 
 fn pipe_to(program: &str, args: &[&str], text: &str) -> bool {
