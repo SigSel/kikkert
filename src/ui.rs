@@ -6,6 +6,7 @@ mod theme;
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::ops::Range;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
@@ -15,12 +16,13 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, CompareView, FilterDialog, FilterField, Focus, Grid, Overlay, Pane, Record, Screen, Total,
-    Workspace,
+    App, CompareRowsView, CompareView, FilterDialog, FilterField, Focus, Grid, Overlay, Pane,
+    Record, Screen, Total, Workspace,
 };
 use crate::compare::{Comparison, Row, Snapshot, Status, Verdict};
 use crate::db::Engine;
 use crate::db::meta::ObjectKind;
+use crate::diff::{RowSnapshot, changed};
 use crate::input::{Editor, Input};
 use crate::query::{Dir, Filter, Mode, Op};
 use theme::theme;
@@ -339,11 +341,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Record(record) => {
-            if let Some(grid) = ws.and_then(Workspace::grid) {
-                draw_record(frame, body, record, grid);
+            if let Some(ws) = ws
+                && let Some(grid) = ws.grid()
+            {
+                let marked = ws.tab == 0
+                    && ws.marked_row_here().is_some_and(|marked| {
+                        grid.result
+                            .rows
+                            .get(grid.row)
+                            .is_some_and(|row| marked.is(row))
+                    });
+                draw_record(frame, body, record, grid, marked);
             }
         }
         Overlay::Compare(view) => draw_compare(frame, body, view),
+        Overlay::CompareRows(view) => draw_compare_rows(frame, body, view),
         Overlay::None | Overlay::Editor(_) => {}
     }
 }
@@ -531,6 +543,13 @@ fn hints(app: &App) -> Hints {
                 ("y", "copy"),
                 ("?", "help"),
             ],
+            Focus::Main if ws.marked_row_here().is_some() => &[
+                ("m", "compare with marked"),
+                ("M", "mark instead"),
+                ("Enter", "row"),
+                ("y", "copy"),
+                ("?", "help"),
+            ],
             Focus::Main if ws.custom.is_some() => &[
                 ("e", "edit SQL"),
                 ("Backspace", "table"),
@@ -543,6 +562,13 @@ fn hints(app: &App) -> Hints {
                 ("]", "next"),
                 ("?", "help"),
             ],
+            Focus::Main if ws.behind_groups() => &[
+                ("m", "mark to compare"),
+                ("Enter", "row"),
+                ("Esc", "back"),
+                ("/", "filter"),
+                ("?", "help"),
+            ],
             Focus::Main => &[
                 ("/", "filter"),
                 ("s", "sort"),
@@ -550,6 +576,7 @@ fn hints(app: &App) -> Hints {
                 ("Enter", "row"),
                 ("e", "SQL"),
                 ("v", "compare"),
+                ("m", "mark row"),
                 ("?", "help"),
             ],
         },
@@ -614,6 +641,14 @@ fn position_text(app: &App) -> Vec<String> {
                 if count == 1 { "" } else { "s" }
             ));
         }
+    }
+    if ws.tab == 0
+        && let Some(marked) = ws.marked_row_here()
+    {
+        parts.push(format!(
+            "{} marked",
+            fit(&marked.label, 30, false).trim_end()
+        ));
     }
 
     let elapsed = grid.result.elapsed;
@@ -899,18 +934,22 @@ fn draw_workspace(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(block, pane_area);
     let text_area = inner.inner(Margin::new(1, 0));
 
-    let (sorts, marked) = match (&ws.table, ws.builder_active() && ws.groups().is_none()) {
-        (Some(table), true) => (
-            table
+    let mut decor = match (&ws.table, ws.builder_active() && ws.groups().is_none()) {
+        (Some(table), true) => Decor {
+            sorts: table
                 .query
                 .sorts
                 .iter()
                 .map(|s| (s.column.clone(), s.dir))
-                .collect::<Vec<_>>(),
-            table.marked.clone(),
-        ),
-        _ => (Vec::new(), BTreeSet::new()),
+                .collect(),
+            columns: table.marked.clone(),
+            row: None,
+        },
+        _ => Decor::default(),
     };
+    if ws.tab == 0 {
+        decor.row = ws.marked_row_here().cloned();
+    }
     let empty_hint: Vec<Line<'static>> = if ws.objects.is_empty() {
         vec![
             Line::styled("This login cannot see any tables here.", subtle()),
@@ -939,7 +978,7 @@ fn draw_workspace(frame: &mut Frame, area: Rect, app: &mut App) {
         ]
     };
     match ws.pane_mut() {
-        Pane::Grid(grid) => draw_grid(frame, pane_area, inner, grid, focused, &sorts, &marked),
+        Pane::Grid(grid) => draw_grid(frame, pane_area, inner, grid, focused, &decor),
         Pane::Loading => draw_centered(
             frame,
             text_area,
@@ -1204,6 +1243,16 @@ fn draw_editor(frame: &mut Frame, area: Rect, editor: &Editor) {
     ));
 }
 
+/// What a grid shows besides the values.
+#[derive(Default)]
+struct Decor {
+    sorts: Vec<(String, Dir)>,
+    /// Columns marked with Space.
+    columns: BTreeSet<String>,
+    /// The row marked with `m`.
+    row: Option<RowSnapshot>,
+}
+
 /// The rows of a result. `area` is inside `frame_area`'s border, where the
 /// scroll thumbs go.
 fn draw_grid(
@@ -1212,10 +1261,10 @@ fn draw_grid(
     area: Rect,
     grid: &mut Grid,
     focused: bool,
-    sorts: &[(String, Dir)],
-    marked: &BTreeSet<String>,
+    decor: &Decor,
 ) {
     let t = theme();
+    let (sorts, marked) = (&decor.sorts, &decor.columns);
     if area.height < 2 || area.width < 6 {
         return;
     }
@@ -1357,6 +1406,19 @@ fn draw_grid(
             buffer.set_stringn(x + width as u16 + 2, area.y, "│", 1, faint());
         }
         x += width as u16 + 3;
+    }
+
+    // The marked row, in the margin before the first column.
+    if let Some(row) = &decor.row {
+        for line in 0..body.min(rows.saturating_sub(grid.row_off)) {
+            let r = grid.row_off + line;
+            if row.is(&grid.result.rows[r]) {
+                let on_cursor = focused && r == grid.row && grid.col == grid.col_off;
+                buffer[(area.x, area.y + 1 + line as u16)]
+                    .set_symbol("●")
+                    .set_fg(if on_cursor { t.on_accent } else { t.warn });
+            }
+        }
     }
 
     if rows == 0 {
@@ -1658,7 +1720,7 @@ fn draw_filters(frame: &mut Frame, area: Rect, selected_index: usize, ws: &Works
 
 /// One row shown vertically: every column on its own line, with the full
 /// value of the selected one below.
-fn draw_record(frame: &mut Frame, area: Rect, record: &mut Record, grid: &Grid) {
+fn draw_record(frame: &mut Frame, area: Rect, record: &mut Record, grid: &Grid, marked: bool) {
     let t = theme();
     let Some(row) = grid.result.rows.get(grid.row) else {
         return;
@@ -1666,7 +1728,10 @@ fn draw_record(frame: &mut Frame, area: Rect, record: &mut Record, grid: &Grid) 
     let width = area.width.saturating_sub(6).min(120);
     let height = area.height.saturating_sub(2);
     let at = centered(area, width, height);
-    let title = format!("Row {} of {} shown", grid.row + 1, grid.rows());
+    let mut title = format!("Row {} of {} shown", grid.row + 1, grid.rows());
+    if marked {
+        title.push_str(" · marked");
+    }
     let inner = popup(
         frame,
         at,
@@ -1676,6 +1741,7 @@ fn draw_record(frame: &mut Frame, area: Rect, record: &mut Record, grid: &Grid) 
             ("←→", "row"),
             ("y", "copy"),
             ("=", "filter"),
+            ("m", "mark"),
             ("Esc", "close"),
         ],
     );
@@ -2135,6 +2201,358 @@ fn draw_compare(frame: &mut Frame, area: Rect, view: &mut CompareView) {
     frame.render_widget(Paragraph::new(detail), detail_area);
 }
 
+/// A value of a compared row, with NULL and the empty string told apart.
+fn row_cell(value: Option<&str>, style: Style) -> (&str, Style) {
+    match value {
+        None => ("NULL", null()),
+        Some("") => ("''", muted()),
+        Some(value) => (value, style),
+    }
+}
+
+/// Text from pieces in their own styles, with a new line at each line break.
+fn styled_lines(pieces: Vec<(String, Style)>) -> Text<'static> {
+    let mut lines = vec![Line::default()];
+    for (text, style) in pieces {
+        for (i, part) in text.split('\n').enumerate() {
+            if i > 0 {
+                lines.push(Line::default());
+            }
+            if !part.is_empty()
+                && let Some(line) = lines.last_mut()
+            {
+                line.spans.push(Span::styled(part.to_string(), style));
+            }
+        }
+    }
+    Text::from(lines)
+}
+
+/// A compared value in full, with the bytes in `changed` picked out. A line
+/// break or carriage return among them is drawn as a sign, so that a change
+/// to one still shows.
+fn changed_text(value: &str, changed: Range<usize>) -> Text<'static> {
+    let shown = |text: &str, picked: bool| {
+        let mut out = String::new();
+        for c in text.chars() {
+            match c {
+                '\n' if picked => out.push_str("⏎\n"),
+                '\n' => out.push('\n'),
+                '\r' if picked => out.push('␍'),
+                '\r' => {}
+                '\t' => out.push_str("    "),
+                c if c.is_control() => out.push('·'),
+                c => out.push(c),
+            }
+        }
+        out
+    };
+    let t = theme();
+    styled_lines(vec![
+        (shown(&value[..changed.start], false), Style::new()),
+        (
+            shown(&value[changed.clone()], true),
+            Style::new().fg(t.on_accent).bg(t.warn),
+        ),
+        (shown(&value[changed.end..], false), Style::new()),
+    ])
+}
+
+/// Two rows: a line per column with both values, and below them both
+/// values of the column under the cursor in full, with where they part
+/// ways picked out.
+fn draw_compare_rows(frame: &mut Frame, area: Rect, view: &mut CompareRowsView) {
+    let t = theme();
+    let shown = view.shown();
+    let comparison = &view.comparison;
+    let (left, right) = (&comparison.left, &comparison.right);
+    let columns = &left.columns;
+
+    // Which rows these are.
+    let mut heading = vec![
+        Span::styled(left.source.clone(), subtle()),
+        Span::styled(" · ", faint()),
+        Span::styled(left.label.clone(), bold()),
+        Span::styled("  →  ", accent()),
+    ];
+    if right.source != left.source {
+        heading.extend([
+            Span::styled(right.source.clone(), subtle()),
+            Span::styled(" · ", faint()),
+        ]);
+    }
+    heading.push(Span::styled(right.label.clone(), bold()));
+    let heading = Line::from(heading);
+
+    // How many columns differ.
+    let differences = comparison.differences();
+    let summary = if differences == 0 {
+        Line::styled(
+            "✓ The same in every column",
+            good().add_modifier(Modifier::BOLD),
+        )
+    } else {
+        let mut spans = Vec::new();
+        for (status, count, what) in [
+            (
+                Status::Different,
+                differences,
+                if differences == 1 {
+                    "differs"
+                } else {
+                    "differ"
+                },
+            ),
+            (
+                Status::Same,
+                columns.len() - differences - left.key.len(),
+                "the same",
+            ),
+        ] {
+            if count > 0 {
+                let (mark, style) = status_mark(status);
+                spans.extend([
+                    Span::styled(format!("{mark} "), style),
+                    Span::raw(format!("{count} ")),
+                    Span::styled(format!("{what}   "), muted()),
+                ]);
+            }
+        }
+        Line::from(spans)
+    };
+
+    let name_width = columns
+        .iter()
+        .map(|c| text_width(&c.name))
+        .chain([text_width("column")])
+        .max()
+        .unwrap_or(0)
+        .min(32);
+    let value_width = (0..columns.len())
+        .flat_map(|i| [left.value(i), right.value(i)])
+        .map(|v| v.map_or(4, |v| cell_width(v, 60).max(2)))
+        .chain([text_width(&left.label), text_width(&right.label)])
+        .max()
+        .unwrap_or(0)
+        .min(60);
+    // Three for the bar and the mark, two before each value.
+    let gaps = 3 + 4;
+
+    // The box is as big as what it shows, within the screen. Below the list
+    // there is room for the longest value, wrapped, up to a point.
+    let content_width = (gaps + name_width + 2 * value_width)
+        .max(heading.width())
+        .max(72) as u16;
+    let width = (content_width + 4).min(area.width.saturating_sub(6));
+    let half = (width.saturating_sub(8) as usize / 2).max(1);
+    let lines_of = |v: Option<&str>| {
+        v.map_or(1, |v| {
+            v.split('\n')
+                .map(|line| text_width(line).div_ceil(half).max(1))
+                .sum::<usize>()
+        })
+    };
+    let value_lines = (0..columns.len())
+        .map(|i| lines_of(left.value(i)).max(lines_of(right.value(i))))
+        .max()
+        .unwrap_or(1)
+        .clamp(1, 8) as u16;
+    let detail_height = 2 + value_lines;
+    let content_height = 4 + columns.len() as u16 + 1 + detail_height;
+    let at = centered(
+        area,
+        width,
+        (content_height + 2)
+            .max(16)
+            .min(area.height.saturating_sub(2)),
+    );
+    let toggle = if view.differences_only {
+        ("d", "all columns")
+    } else {
+        ("d", "only differences")
+    };
+    let inner = popup(
+        frame,
+        at,
+        "Compare rows",
+        &[("↑↓", "column"), ("←→", "row"), toggle, ("Esc", "close")],
+    );
+    if inner.height < 8 || inner.width < 30 {
+        return;
+    }
+    let room = inner.width as usize;
+    let mut widths = [name_width, value_width, value_width];
+    squeeze(&mut widths, room.saturating_sub(gaps), 4);
+
+    let detail_height = detail_height.min(inner.height / 2);
+    let [heading_area, summary_area, _, list_area, _, detail_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(2),
+        Constraint::Length(1),
+        Constraint::Length(detail_height),
+    ])
+    .areas(inner);
+
+    let heading = if heading.width() <= room {
+        heading
+    } else {
+        Line::raw(fit(&heading.to_string(), room, false))
+    };
+    frame.render_widget(Paragraph::new(heading), heading_area);
+    frame.render_widget(Paragraph::new(summary), summary_area);
+
+    let body = list_area.height.saturating_sub(1) as usize;
+    view.page_rows = body;
+    view.selected = view.selected.min(shown.len().saturating_sub(1));
+    if view.selected < view.offset {
+        view.offset = view.selected;
+    } else if body > 0 && view.selected >= view.offset + body {
+        view.offset = view.selected + 1 - body;
+    }
+    view.offset = view.offset.min(shown.len().saturating_sub(body));
+
+    let header = Line::from(vec![
+        Span::raw(format!("   {}", fit("column", widths[0], false))),
+        Span::raw(format!("  {}", fit(&left.label, widths[1], false))),
+        Span::raw(format!("  {}", fit(&right.label, widths[2], false))),
+    ])
+    .style(Style::new().bg(t.surface).fg(t.subtle));
+    let mut lines = vec![header];
+    for (line, &i) in shown.iter().enumerate().skip(view.offset).take(body) {
+        let selected = line == view.selected;
+        let differs = comparison.differs[i];
+        let (mark, mark_style) = if left.is_key(i) {
+            ("#", faint())
+        } else if differs {
+            status_mark(Status::Different)
+        } else {
+            status_mark(Status::Same)
+        };
+        // The columns that agree recede, so the ones that differ stand out.
+        let (name_style, value_style) = if differs {
+            (Style::new(), Style::new().fg(t.warn))
+        } else {
+            (muted(), subtle())
+        };
+        let cell = |value: Option<&str>, width: usize| {
+            let (text, style) = row_cell(value, value_style);
+            Span::styled(format!("  {}", fit(text, width, false)), style)
+        };
+        let mut line = Line::from(vec![
+            Span::styled(if selected { "▌" } else { " " }, accent()),
+            Span::styled(format!("{mark} "), mark_style),
+            Span::styled(
+                fit(&columns[i].name, widths[0], false),
+                if selected {
+                    highlight(true)
+                } else {
+                    name_style
+                },
+            ),
+            cell(left.value(i), widths[1]),
+            cell(right.value(i), widths[2]),
+        ]);
+        if selected {
+            line = line.style(Style::new().bg(t.surface).fg(t.text));
+        }
+        lines.push(line);
+    }
+    frame.render_widget(Paragraph::new(lines), list_area);
+    if shown.is_empty() {
+        draw_centered(
+            frame,
+            Rect {
+                y: list_area.y + 1,
+                height: list_area.height.saturating_sub(1),
+                ..list_area
+            },
+            vec![Line::from(vec![
+                Span::styled("No differences. ", muted()),
+                Span::styled("d", accent()),
+                Span::styled(" shows every column.", muted()),
+            ])],
+        );
+    }
+    let track = Rect {
+        x: at.right().saturating_sub(1),
+        y: list_area.y + 1,
+        width: 1,
+        height: list_area.height.saturating_sub(1),
+    };
+    scrollbar(frame, track, view.offset, body, shown.len(), true);
+
+    // Both values of the column under the cursor, in full.
+    let Some(&i) = shown.get(view.selected) else {
+        return;
+    };
+    let column = &columns[i];
+    let mut rule = vec![
+        Span::styled("── ", faint()),
+        Span::styled(column.name.clone(), accent().add_modifier(Modifier::BOLD)),
+    ];
+    if !column.type_name.is_empty() {
+        rule.push(Span::styled(format!("  {}", column.type_name), muted()));
+    }
+    rule.push(if left.is_key(i) {
+        Span::styled("  primary key", muted())
+    } else if comparison.differs[i] {
+        Span::styled("  differs", status_mark(Status::Different).1)
+    } else {
+        Span::styled("  the same", muted())
+    });
+    let used = Line::from(rule.clone()).width() + 1;
+    rule.push(Span::styled(
+        format!(" {}", "─".repeat(room.saturating_sub(used))),
+        faint(),
+    ));
+    let [rule_area, labels_area, values_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(detail_area);
+    frame.render_widget(Paragraph::new(Line::from(rule)), rule_area);
+
+    let sides = |area: Rect| -> [Rect; 2] {
+        let [_, left, _, right] = Layout::horizontal([
+            Constraint::Length(2),
+            Constraint::Fill(1),
+            Constraint::Length(2),
+            Constraint::Fill(1),
+        ])
+        .areas(area);
+        [left, right]
+    };
+    let (left_value, right_value) = (left.value(i), right.value(i));
+    let (left_changed, right_changed) = match (left_value, right_value) {
+        (Some(l), Some(r)) => changed(l, r),
+        _ => (0..0, 0..0),
+    };
+    let full = |value: Option<&str>, changed: Range<usize>| match value {
+        None => Text::styled("NULL", null()),
+        Some("") => Text::styled("''", muted()),
+        Some(value) => changed_text(value, changed),
+    };
+    let label_areas = sides(labels_area);
+    let value_areas = sides(values_area);
+    for (k, (row, value, changed)) in [
+        (left, left_value, left_changed),
+        (right, right_value, right_changed),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let label = fit(&row.label, label_areas[k].width as usize, false);
+        frame.render_widget(Paragraph::new(label).style(bold()), label_areas[k]);
+        frame.render_widget(
+            Paragraph::new(full(value, changed)).wrap(Wrap { trim: false }),
+            value_areas[k],
+        );
+    }
+}
+
 /// JSON reads better indented and coloured; everything else is shown as it
 /// is.
 fn pretty(value: &str) -> Text<'static> {
@@ -2217,11 +2635,14 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: &mut u16) {
             ],
         ),
         (
-            "Compare tables",
+            "Compare",
             &[
                 ("v", "hold this table's columns; on another, compare"),
                 ("V", "hold this table's columns instead"),
+                ("m", "mark this row; on another, compare; again, unmark"),
+                ("M", "mark this row in place of the one marked"),
                 ("d", "in a comparison: only the differences"),
+                ("←→", "comparing rows: the next or previous row"),
             ],
         ),
         (

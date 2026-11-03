@@ -5,6 +5,7 @@ pub mod clipboard;
 pub mod compare;
 pub mod config;
 pub mod db;
+pub mod diff;
 pub mod input;
 pub mod op;
 pub mod query;

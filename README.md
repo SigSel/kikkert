@@ -11,6 +11,7 @@ distance, and never touches it.
 - **Search without writing SQL:** pick a column, how to match and a value.
   kikkert writes the SQL, shows it, and lets you edit it.
 - **Sort, page, find duplicates, inspect structure**, all from the keyboard.
+- **Compare two rows side by side**, to see what sets two duplicates apart.
 - **Compare two tables' columns**, across connections and even across engines.
 - **Read-only by construction:** see [How read-only is enforced](#how-read-only-is-enforced).
 
@@ -146,6 +147,8 @@ Press `?` at any time for the full list of keys.
 | `d` | values of this column that occur more than once |
 | `D` | every value of this column with its count |
 | `Space` | mark columns, to check a combination for duplicates |
+| `m` | mark this row; on another row, compare the two; on the marked row, unmark it |
+| `M` | mark this row in place of the one marked |
 | `Backspace` | go back |
 | `1`–`5` | Data, Columns, Indexes, Keys, Definition |
 | `e` | edit the SQL; `F5` or `Ctrl-R` runs it |
@@ -181,6 +184,19 @@ be in another connection, even on another engine. Types and defaults that two
 engines spell differently, such as `integer` and `int` or `true` and `1`, are
 marked as alike rather than different, and `d` narrows the list to the real
 differences. The held table is named in the title bar until `V` holds another.
+
+`m` does the same for two rows. After `d` and `Enter` have shown the rows
+behind a duplicate, `m` on one of them marks it (a `●` in the margin), and `m`
+on another shows the two side by side, a line per column, with `≠` where they
+differ. The cursor starts on the first difference, and below the list both
+values of the column under it are shown in full with the part that differs
+picked out, so a trailing space or a change of case shows. `d` narrows the list
+to the differences, and `←` `→` compare the marked row with the previous or
+next one, for a value that occurs three or more times. Rows are named by their
+primary key, which is not counted as a difference, or else by their position.
+The mark stays while you page, sort and go back, until another table is opened.
+It works on rows from hand-written SQL too, as long as both rows have the same
+columns.
 
 Filtering "contains" works on any column, not only text: numbers, dates and
 ids are compared as text, so `2024-03` finds March and `42` finds order 1042.

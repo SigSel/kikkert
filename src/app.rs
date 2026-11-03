@@ -18,6 +18,7 @@ use crate::compare::{Comparison, Snapshot};
 use crate::config::{self, Config};
 use crate::db::meta::{self, DbObject, StructureTab};
 use crate::db::{ResultColumn, ResultSet, Session};
+use crate::diff::{RowComparison, RowSnapshot};
 use crate::input::{Editor, Input};
 use crate::op;
 use crate::query::{ColumnInfo, Filter, Mode, Op, TableQuery};
@@ -278,6 +279,8 @@ pub struct Workspace {
     pub total: Total,
     /// Earlier states of the query, for Backspace.
     pub back: Vec<TableQuery>,
+    /// The row marked with `m`, to compare another row with.
+    pub marked_row: Option<RowSnapshot>,
     draft: Option<String>,
     jobs: Jobs,
 }
@@ -355,6 +358,72 @@ impl Workspace {
             _ => None,
         }
     }
+
+    /// True when the Data tab shows the rows behind a line of duplicates or
+    /// values, which Enter on that line brought up.
+    pub fn behind_groups(&self) -> bool {
+        self.builder_active()
+            && self.groups().is_none()
+            && self
+                .back
+                .last()
+                .is_some_and(|q| matches!(q.mode, Mode::Groups { .. }))
+    }
+
+    /// The row under the cursor in the Data tab, copied out to compare.
+    pub fn row_snapshot(&self) -> Option<RowSnapshot> {
+        let Pane::Grid(grid) = &self.data else {
+            return None;
+        };
+        let values = grid.result.rows.get(grid.row)?.clone();
+        let table = self.table.as_ref().filter(|_| self.custom.is_none());
+        let key: Vec<usize> = table
+            .and_then(|table| {
+                table
+                    .query
+                    .columns
+                    .iter()
+                    .filter(|c| c.primary_key)
+                    .map(|c| grid.result.columns.iter().position(|r| r.name == c.name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A primary key names a row for good; a position changes with the sort.
+        let label = if key.is_empty() {
+            let offset = table.map_or(0, |t| t.query.offset());
+            format!("row {}", offset + grid.row + 1)
+        } else {
+            key.iter()
+                .map(|&i| {
+                    let value = values.get(i).and_then(Option::as_deref);
+                    let name = &grid.result.columns[i].name;
+                    format!("{name} {}", value.unwrap_or("NULL"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        Some(RowSnapshot {
+            source: table.map_or_else(
+                || "hand-written SQL".to_string(),
+                |t| t.object.display_name(),
+            ),
+            label,
+            columns: grid.result.columns.clone(),
+            values,
+            key,
+        })
+    }
+
+    /// The row marked with `m`, while the Data tab shows rows it can be
+    /// compared with.
+    pub fn marked_row_here(&self) -> Option<&RowSnapshot> {
+        let Pane::Grid(grid) = &self.data else {
+            return None;
+        };
+        self.marked_row
+            .as_ref()
+            .filter(|marked| self.groups().is_none() && marked.fits(&grid.result.columns))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -427,6 +496,39 @@ impl CompareView {
     }
 }
 
+/// Two rows side by side, a line per column, and where the cursor is.
+pub struct CompareRowsView {
+    pub comparison: RowComparison,
+    /// Hide the columns where the two rows agree.
+    pub differences_only: bool,
+    /// Index into [`CompareRowsView::shown`].
+    pub selected: usize,
+    pub offset: usize,
+    /// How many rows fit on screen; the renderer keeps this current.
+    pub page_rows: usize,
+}
+
+impl CompareRowsView {
+    /// Starts on the first column where the rows differ.
+    fn new(comparison: RowComparison) -> CompareRowsView {
+        CompareRowsView {
+            selected: comparison.differs.iter().position(|d| *d).unwrap_or(0),
+            comparison,
+            differences_only: false,
+            offset: 0,
+            page_rows: 10,
+        }
+    }
+
+    /// Indexes of the columns on show.
+    pub fn shown(&self) -> Vec<usize> {
+        let differs = &self.comparison.differs;
+        (0..differs.len())
+            .filter(|&i| !self.differences_only || differs[i])
+            .collect()
+    }
+}
+
 pub enum Overlay {
     None,
     Help { scroll: u16 },
@@ -435,6 +537,7 @@ pub enum Overlay {
     Record(Record),
     Editor(Editor),
     Compare(CompareView),
+    CompareRows(CompareRowsView),
 }
 
 pub struct App {
@@ -468,6 +571,32 @@ fn is_ctrl(key: &KeyEvent) -> bool {
 /// F5 or Ctrl-R: run the SQL in the editor, or run the data view again.
 fn is_run(key: &KeyEvent) -> bool {
     key.code == KeyCode::F(5) || (is_ctrl(key) && key.code == KeyCode::Char('r'))
+}
+
+/// Moves the cursor of a list of `len` lines, `page` of which fit on
+/// screen. Returns whether the key was a movement key.
+fn step_list(selected: &mut usize, len: usize, page: usize, key: KeyEvent) -> bool {
+    let last = len.saturating_sub(1);
+    let page = page.max(2);
+    *selected = match key.code {
+        KeyCode::Down | KeyCode::Char('j') => (*selected + 1).min(last),
+        KeyCode::Up | KeyCode::Char('k') => selected.saturating_sub(1),
+        KeyCode::PageDown => (*selected + page - 1).min(last),
+        KeyCode::PageUp => selected.saturating_sub(page - 1),
+        KeyCode::Home | KeyCode::Char('g') => 0,
+        KeyCode::End | KeyCode::Char('G') => last,
+        _ => return false,
+    };
+    true
+}
+
+/// Where a list's cursor goes when the lines on show change: to line `line`
+/// if it is still shown, else to the next one that is.
+fn settle(shown: &[usize], line: usize) -> usize {
+    shown
+        .iter()
+        .position(|&i| i >= line)
+        .unwrap_or(shown.len().saturating_sub(1))
 }
 
 impl App {
@@ -639,6 +768,7 @@ impl App {
             sql: String::new(),
             total: Total::Unavailable,
             back: Vec::new(),
+            marked_row: None,
             draft: None,
             jobs: Jobs::default(),
         };
@@ -697,6 +827,7 @@ impl App {
                 ws.tab = 0;
                 ws.sql.clear();
                 ws.back.clear();
+                ws.marked_row = None;
                 ws.total = Total::Unavailable;
                 ws.data = Pane::Error(error);
             }
@@ -917,6 +1048,7 @@ impl App {
         ws.tab = 0;
         ws.sql = opened.sql;
         ws.back.clear();
+        ws.marked_row = None;
         ws.total = Total::Unknown;
         ws.focus = Focus::Main;
         ws.data = Pane::Empty;
@@ -1347,6 +1479,70 @@ impl App {
         }
     }
 
+    /// `m` marks the row under the cursor, and on another row compares the
+    /// two; on the marked row it unmarks it. With `instead`, for `M`, the
+    /// row is marked in place of the one marked.
+    fn mark_row(&mut self, instead: bool) {
+        let Some(ws) = self.ws_mut() else { return };
+        if ws.tab != 0 {
+            self.say("Press 1 to go to the data first");
+            return;
+        }
+        if ws.groups().is_some() {
+            self.say("Enter shows the rows behind this line; m marks one of them to compare");
+            return;
+        }
+        let Some(row) = ws.row_snapshot() else { return };
+        match ws.marked_row.take() {
+            Some(marked) if !instead && marked.fits(&row.columns) && marked.is(&row.values) => {
+                self.say(format!("Unmarked {}", marked.label));
+            }
+            Some(marked) if !instead && marked.fits(&row.columns) => {
+                ws.marked_row = Some(marked.clone());
+                self.overlay =
+                    Overlay::CompareRows(CompareRowsView::new(RowComparison::new(marked, row)));
+            }
+            _ => {
+                let text = format!("Marked {}: m on another row compares the two", row.label);
+                ws.marked_row = Some(row);
+                self.say(text);
+            }
+        }
+    }
+
+    /// Compares the marked row with the next row shown (`1`) or the
+    /// previous one (`-1`) instead, passing over the marked row itself.
+    fn step_compared(&mut self, view: &mut CompareRowsView, step: isize) {
+        let left = view.comparison.left.clone();
+        let Some(ws) = self.ws_mut() else { return };
+        let Some(grid) = ws.grid_mut().filter(|g| left.fits(&g.result.columns)) else {
+            return;
+        };
+        let mut row = grid.row;
+        let next = loop {
+            match row.checked_add_signed(step).filter(|&r| r < grid.rows()) {
+                Some(next) if left.is(&grid.result.rows[next]) => row = next,
+                next => break next,
+            }
+        };
+        let Some(next) = next else {
+            self.say(if step > 0 {
+                "This is the last row shown"
+            } else {
+                "This is the first row shown"
+            });
+            return;
+        };
+        grid.row = next;
+        let Some(right) = ws.row_snapshot() else {
+            return;
+        };
+        // Stay on the same column, or the next one still shown.
+        let column = view.shown().get(view.selected).copied().unwrap_or(0);
+        view.comparison = RowComparison::new(left, right);
+        view.selected = settle(&view.shown(), column);
+    }
+
     fn open_editor(&mut self) {
         let Some(ws) = self.ws_mut() else { return };
         let text = ws
@@ -1453,6 +1649,7 @@ impl App {
             Overlay::Record(record) => self.record_key(record, key),
             Overlay::Editor(editor) => self.editor_key(editor, key),
             Overlay::Compare(view) => self.compare_key(view, key),
+            Overlay::CompareRows(view) => self.compare_rows_key(view, key),
         }
     }
 
@@ -1663,6 +1860,8 @@ impl App {
             }
             KeyCode::Char('y') => self.yank(false),
             KeyCode::Char('Y') => self.yank(true),
+            KeyCode::Char('m') => self.mark_row(false),
+            KeyCode::Char('M') => self.mark_row(true),
             _ if is_run(&key) => self.reload(),
             KeyCode::Backspace if ws.tab == 0 => self.go_back(),
             // Esc also backs out of duplicates and the rows shown from them,
@@ -1878,6 +2077,12 @@ impl App {
                 }
                 self.say("Filtering by value works on a table's data");
             }
+            KeyCode::Char('m' | 'M') => {
+                self.mark_row(key.code == KeyCode::Char('M'));
+                if matches!(self.overlay, Overlay::CompareRows(_)) {
+                    return;
+                }
+            }
             _ => {}
         }
         if record.field != shown_field || row_step != 0 {
@@ -1899,29 +2104,37 @@ impl App {
 
     fn compare_key(&mut self, mut view: CompareView, key: KeyEvent) {
         let shown = view.shown();
-        let last = shown.len().saturating_sub(1);
-        let page = view.page_rows.max(2);
-        match key.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'v') => return,
-            KeyCode::Down | KeyCode::Char('j') => view.selected = (view.selected + 1).min(last),
-            KeyCode::Up | KeyCode::Char('k') => view.selected = view.selected.saturating_sub(1),
-            KeyCode::PageDown => view.selected = (view.selected + page - 1).min(last),
-            KeyCode::PageUp => view.selected = view.selected.saturating_sub(page - 1),
-            KeyCode::Home | KeyCode::Char('g') => view.selected = 0,
-            KeyCode::End | KeyCode::Char('G') => view.selected = last,
-            KeyCode::Char('d') => {
-                // Stay on the same column, or the next one still shown.
-                let row = shown.get(view.selected).copied().unwrap_or(0);
-                view.differences_only = !view.differences_only;
-                let now = view.shown();
-                view.selected = now
-                    .iter()
-                    .position(|&i| i >= row)
-                    .unwrap_or(now.len().saturating_sub(1));
+        if !step_list(&mut view.selected, shown.len(), view.page_rows, key) {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'v') => return,
+                KeyCode::Char('d') => {
+                    // Stay on the same column, or the next one still shown.
+                    let row = shown.get(view.selected).copied().unwrap_or(0);
+                    view.differences_only = !view.differences_only;
+                    view.selected = settle(&view.shown(), row);
+                }
+                _ => {}
             }
-            _ => {}
         }
         self.overlay = Overlay::Compare(view);
+    }
+
+    fn compare_rows_key(&mut self, mut view: CompareRowsView, key: KeyEvent) {
+        let shown = view.shown();
+        if !step_list(&mut view.selected, shown.len(), view.page_rows, key) {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'm') => return,
+                KeyCode::Char('d') => {
+                    let column = shown.get(view.selected).copied().unwrap_or(0);
+                    view.differences_only = !view.differences_only;
+                    view.selected = settle(&view.shown(), column);
+                }
+                KeyCode::Right | KeyCode::Char('l') => self.step_compared(&mut view, 1),
+                KeyCode::Left | KeyCode::Char('h') => self.step_compared(&mut view, -1),
+                _ => {}
+            }
+        }
+        self.overlay = Overlay::CompareRows(view);
     }
 
     fn editor_key(&mut self, mut editor: Editor, key: KeyEvent) {
