@@ -51,6 +51,8 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: ci
     strategy:
+      # Let both finish, so one failing does not hide how the other went.
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl

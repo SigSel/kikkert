@@ -21,8 +21,9 @@ export "CC_${target//-/_}=musl-gcc"
 cargo build --release --locked --target "$target"
 
 # The point of a musl build: the binary carries its libc and runs on any Linux of its architecture.
+# file(1) says "static-pie linked" for x86_64 and "statically linked" for aarch64.
 file "$bin"
-if ! file "$bin" | grep -q -E 'static(-pie)? linked'; then
+if ! file "$bin" | grep -q -E 'static-pie linked|statically linked'; then
     echo "$bin is not statically linked" >&2
     exit 1
 fi
