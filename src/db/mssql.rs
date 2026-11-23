@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::TryStreamExt;
+use tiberius::time::time::{Date, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 use tiberius::{
     AuthMethod, ColumnData, ColumnType, Config, EncryptionLevel, FromSql, QueryItem, SqlBrowser,
 };
@@ -225,25 +226,45 @@ fn cell(data: ColumnData<'static>) -> Option<String> {
         ColumnData::Xml(v) => v.map(|v| v.to_string()),
         ref temporal @ (ColumnData::DateTime(_)
         | ColumnData::SmallDateTime(_)
-        | ColumnData::DateTime2(_)) => chrono::NaiveDateTime::from_sql(temporal)
+        | ColumnData::DateTime2(_)) => PrimitiveDateTime::from_sql(temporal)
             .ok()
             .flatten()
-            .map(|v| v.format("%Y-%m-%d %H:%M:%S%.f").to_string()),
-        ref date @ ColumnData::Date(_) => chrono::NaiveDate::from_sql(date)
-            .ok()
-            .flatten()
-            .map(|v| v.format("%Y-%m-%d").to_string()),
-        ref time @ ColumnData::Time(_) => chrono::NaiveTime::from_sql(time)
-            .ok()
-            .flatten()
-            .map(|v| v.format("%H:%M:%S%.f").to_string()),
+            .map(|v| format!("{} {}", format_date(v.date()), format_time(v.time()))),
+        ref date @ ColumnData::Date(_) => Date::from_sql(date).ok().flatten().map(format_date),
+        ref time @ ColumnData::Time(_) => Time::from_sql(time).ok().flatten().map(format_time),
         ref offset @ ColumnData::DateTimeOffset(_) => {
-            chrono::DateTime::<chrono::FixedOffset>::from_sql(offset)
-                .ok()
-                .flatten()
-                .map(|v| v.format("%Y-%m-%d %H:%M:%S%.f %:z").to_string())
+            OffsetDateTime::from_sql(offset).ok().flatten().map(|v| {
+                let (date, time) = (format_date(v.date()), format_time(v.time()));
+                format!("{date} {time} {}", format_offset(v.offset()))
+            })
         }
     }
+}
+
+/// `2024-03-05`
+fn format_date(date: Date) -> String {
+    let (year, month, day) = (date.year(), u8::from(date.month()), date.day());
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// `13:45:09`, with the fraction of a second in as many digits as it needs: 3, 6 or 9.
+fn format_time(time: Time) -> String {
+    let fraction = match time.nanosecond() {
+        0 => String::new(),
+        n if n % 1_000_000 == 0 => format!(".{:03}", n / 1_000_000),
+        n if n % 1_000 == 0 => format!(".{:06}", n / 1_000),
+        n => format!(".{n:09}"),
+    };
+    let (hour, minute, second) = time.as_hms();
+    format!("{hour:02}:{minute:02}:{second:02}{fraction}")
+}
+
+/// `+01:00`
+fn format_offset(offset: UtcOffset) -> String {
+    let minutes = offset.whole_minutes();
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let minutes = minutes.unsigned_abs();
+    format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
 /// SQL Server binary values are always shown the way SSMS shows them.
@@ -263,5 +284,100 @@ fn describe(error: tiberius::error::Error) -> anyhow::Error {
     match error {
         tiberius::error::Error::Server(token) => anyhow!("{}", token.message()),
         other => anyhow!("{other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tiberius::time::{Date, DateTime, DateTime2, DateTimeOffset, SmallDateTime, Time};
+
+    // SQL Server counts days from 0001-01-01 for date, datetime2 and datetimeoffset, and from
+    // 1900-01-01 for datetime and smalldatetime.
+    const MAR_5_2024: u32 = 738_949;
+    const MAR_5_2024_FROM_1900: i32 = 45_354;
+    /// 13:45:09, in seconds after midnight.
+    const AFTERNOON: u64 = 49_509;
+
+    /// A time of day: `secs` and then `fraction` in units of 10^-scale seconds.
+    fn time(secs: u64, fraction: u64, scale: u8) -> Time {
+        Time::new(secs * 10u64.pow(scale.into()) + fraction, scale)
+    }
+
+    fn datetime2(days: u32, time: Time) -> ColumnData<'static> {
+        ColumnData::DateTime2(Some(DateTime2::new(Date::new(days), time)))
+    }
+
+    fn shown(data: ColumnData<'static>) -> String {
+        cell(data).expect("a value")
+    }
+
+    #[test]
+    fn datetime2_shows_as_many_fraction_digits_as_it_needs() {
+        let at = |fraction, scale| shown(datetime2(MAR_5_2024, time(AFTERNOON, fraction, scale)));
+        assert_eq!(at(0, 0), "2024-03-05 13:45:09");
+        assert_eq!(at(0, 7), "2024-03-05 13:45:09");
+        assert_eq!(at(120, 3), "2024-03-05 13:45:09.120");
+        assert_eq!(at(123_456, 6), "2024-03-05 13:45:09.123456");
+        assert_eq!(at(1_234_567, 7), "2024-03-05 13:45:09.123456700");
+    }
+
+    #[test]
+    fn dates_are_zero_padded() {
+        let date = |days| shown(ColumnData::Date(Some(Date::new(days))));
+        assert_eq!(date(0), "0001-01-01");
+        assert_eq!(date(MAR_5_2024), "2024-03-05");
+        assert_eq!(date(3_652_058), "9999-12-31");
+    }
+
+    #[test]
+    fn times_of_day() {
+        let at = |time| shown(ColumnData::Time(Some(time)));
+        assert_eq!(at(time(0, 0, 7)), "00:00:00");
+        assert_eq!(at(time(AFTERNOON, 5, 1)), "13:45:09.500");
+        assert_eq!(at(time(86_399, 9_999_999, 7)), "23:59:59.999999900");
+    }
+
+    #[test]
+    fn datetime_and_smalldatetime() {
+        // datetime counts 1/300 s, so one tick is 3.33 ms.
+        let datetime = |days, ticks| shown(ColumnData::DateTime(Some(DateTime::new(days, ticks))));
+        let ticks = AFTERNOON as u32 * 300;
+        assert_eq!(datetime(MAR_5_2024_FROM_1900, ticks), "2024-03-05 13:45:09");
+        assert_eq!(
+            datetime(MAR_5_2024_FROM_1900, ticks + 1),
+            "2024-03-05 13:45:09.003333333"
+        );
+        assert_eq!(datetime(-1, 0), "1899-12-31 00:00:00");
+
+        // smalldatetime counts minutes.
+        let small = ColumnData::SmallDateTime(Some(SmallDateTime::new(45_354, 13 * 60 + 45)));
+        assert_eq!(shown(small), "2024-03-05 13:45:00");
+    }
+
+    #[test]
+    fn datetimeoffset_shows_the_local_time_and_its_offset() {
+        // Stored as the time in UTC and the offset in minutes.
+        let at = |days, utc_secs, offset| {
+            let utc = DateTime2::new(Date::new(days), time(utc_secs, 0, 7));
+            shown(ColumnData::DateTimeOffset(Some(DateTimeOffset::new(
+                utc, offset,
+            ))))
+        };
+        assert_eq!(
+            at(MAR_5_2024, AFTERNOON - 3_600, 60),
+            "2024-03-05 13:45:09 +01:00"
+        );
+        assert_eq!(at(MAR_5_2024, 3_600, -210), "2024-03-04 21:30:00 -03:30");
+        assert_eq!(at(MAR_5_2024, AFTERNOON, 0), "2024-03-05 13:45:09 +00:00");
+    }
+
+    #[test]
+    fn null_temporals_stay_null() {
+        assert_eq!(cell(ColumnData::DateTime2(None)), None);
+        assert_eq!(cell(ColumnData::Date(None)), None);
+        assert_eq!(cell(ColumnData::Time(None)), None);
+        assert_eq!(cell(ColumnData::DateTimeOffset(None)), None);
+        assert_eq!(cell(ColumnData::DateTime(None)), None);
     }
 }
