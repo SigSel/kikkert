@@ -17,7 +17,32 @@ distance, and never touches it.
 
 ## Install
 
-Cargo can build kikkert straight from GitHub, without a clone:
+### Download
+
+Every [release](https://github.com/SigSel/kikkert/releases) has kikkert
+ready-built for Linux on x86_64 and aarch64 (arm64). The binaries are statically
+linked, so they run on any distribution. This puts the latest release in
+`~/.local/bin`, and running it again updates it:
+
+```sh
+cd "$(mktemp -d)"
+target="$(uname -m)-unknown-linux-musl"
+base=https://github.com/SigSel/kikkert/releases/latest/download
+curl -fL --remote-name-all "$base/kikkert-$target.tar.gz" "$base/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf "kikkert-$target.tar.gz"
+install -D -m 0755 "kikkert-$target/kikkert" ~/.local/bin/kikkert
+```
+
+Each archive also has a signed build provenance attestation on GitHub. With
+the [GitHub CLI](https://cli.github.com/),
+`gh attestation verify kikkert-$target.tar.gz --repo SigSel/kikkert` checks
+that an archive was built by this repository's release workflow.
+
+### Build with Cargo
+
+On other systems, or for the latest commit on `main`, Cargo can build kikkert
+straight from GitHub, without a clone:
 
 ```sh
 cargo install --locked --git https://github.com/SigSel/kikkert
@@ -27,8 +52,11 @@ Running the same command again updates to the latest commit on `main`; add
 `--rev <commit>` to install a particular one. From a clone of the repository,
 `cargo install --locked --path .` does the same.
 
-This needs Rust 1.94 or later and a C compiler (SQLite is built in). 1Password
-connections also need the [1Password CLI](https://developer.1password.com/docs/cli/get-started/)
+This needs Rust 1.94 or later and a C compiler (SQLite is built in).
+
+### For 1Password connections
+
+1Password connections need the [1Password CLI](https://developer.1password.com/docs/cli/get-started/)
 (`op`) with **Settings → Developer → Integrate with 1Password CLI** switched on
 in the desktop app, so that unlocking happens in the app and not in the terminal.
 
@@ -282,6 +310,19 @@ EULA. Without `just`, `scripts/test-dbs.sh up|status|test|down` does the same.
 
 The 1Password integration has only been tested against a stand-in for `op`
 that returns items in the documented JSON format, not against a live account.
+
+### Releasing
+
+Set the version in `Cargo.toml`, run `cargo check` so `Cargo.lock` follows,
+commit, then tag and push the tag:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` then runs the CI checks on the tagged commit,
+builds the Linux binaries and makes a draft release with them. Look it over on
+GitHub and publish it there.
 
 ## License
 
